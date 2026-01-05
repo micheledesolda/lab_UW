@@ -1,5 +1,5 @@
 # lab_uw/forward_modeling.py
-
+import pathlib
 import sys
 import matplotlib.pyplot as plt
 from math import floor
@@ -119,6 +119,7 @@ class UltrasonicModeler:
             # Double-Direct-Shear geometry
             side1_params      = assembly_dict["side1_params"] 
             side2_params      = assembly_dict["side2_params"] 
+            central_params    = assembly_dict["central_params"]
             pzt_layer_width   = side1_params["pzt_layer_width"]
             pla_layer_width   = side1_params["pla_layer_width"]
 
@@ -175,7 +176,12 @@ class UltrasonicModeler:
             h_groove_central = central_params["h_grooves"]
             h_groove_side    = side1_params["h_grooves"]
 
-            steel_velocity = side1_params["velocity" + self.wave_type]
+            block_velocity = {
+                "side1": side1_params["velocity" + self.wave_type],
+                "central": central_params["velocity" + self.wave_type],
+                "side2": side2_params["velocity" + self.wave_type],
+            }
+
             pzt_velocity   = side1_params["pzt_velocity" + self.wave_type]
             pla_velocity   = side1_params["pla_velocity" + self.wave_type]
 
@@ -188,7 +194,7 @@ class UltrasonicModeler:
                 pla_layer_width=pla_layer_width,
                 h_groove_side=h_groove_side,
                 h_groove_central=h_groove_central,
-                steel_velocity=steel_velocity,
+                block_velocity=block_velocity,
                 gouge_velocity=(gouge_velocity_1, gouge_velocity_2),
                 gouge_damping=(gouge_damping_1, gouge_damping_2),
                 pzt_velocity=pzt_velocity,
@@ -320,21 +326,21 @@ class UltrasonicModeler:
         self.receiver_handler       = receiver_handler
         self.misfit                 = misfit
 
-        if self.geometry_type == "dds":
-            damping_label    = str(round(gouge_damping_1,5)).replace(".",",")
-            velocity_label   = str(round(1e4*gouge_velocity_1,5)).replace(".",",")  
-            misfit_label    = str(round(misfit,5)).replace(".",",")
-            label = f"_vel_{velocity_label}_damping_{damping_label}_global_search_{misfit_label}_waveform"
-    
-        else:
-            pzt_vel_label     = str(round(1e4*pzt_velocity)).replace(".",",")
-            steel_vel_label   = str(round(1e4*steel_velocity)).replace(".",",")  
-            misfit_label    = str(round(misfit,5)).replace(".",",")
-            label = f"_pzt_{pzt_vel_label}_vel_{steel_vel_label}_global_search_{misfit_label}_waveform"
-
         if enable_plotting:
-            plot_output_name = plot_output_path.name + label
-            plot_output_path = plot_output_path.parent / plot_output_name
+            if self.geometry_type == "dds":
+                damping_label    = str(round(gouge_damping_1,5)).replace(".",",")
+                velocity_label   = str(round(1e4*gouge_velocity_1)).replace(".",",")  
+                misfit_label    = str(round(misfit)).replace(".",",")
+                label = f"vel_{velocity_label}_damping_{damping_label}_misfit_{misfit_label}"
+        
+            else:
+                pzt_vel_label     = str(round(1e4*pzt_velocity)).replace(".",",")
+                steel_vel_label   = str(round(1e4*steel_velocity)).replace(".",",")  
+                misfit_label    = str(round(misfit)).replace(".",",")
+                label = f"pzt_{pzt_vel_label}_vel_{steel_vel_label}_misfit_{misfit_label}"
+
+            plot_output_name = label
+            plot_output_path = plot_output_path / plot_output_name
             self.plotter.plot_simulation_waveform(
             t=observed_time,
             sp_simulated=synthetic_waveform,
@@ -461,6 +467,7 @@ class UltrasonicModeler:
         da_threshold:          float = 0,
         dw_max_start:          float = 0,
         dw_threshold:          float = 0,
+        stf_duration:          float = 4,   # [mus]  must find a smarte initialization
         ds_max_start:          float = 0,
         ds_threshold:          float = 0,
         reduce_factor:         float = 1/2,
@@ -481,70 +488,78 @@ class UltrasonicModeler:
 
         if self.synthetic_waveform is None:
             raise RuntimeError("No forward-simulation results. Call `forward_simulation()` first.")
-
-        # === UNPACK FORWARD-SIMULATION RESULTS ===
-        # Store results in the instance so we can reuse them
-        absorbing                  = self.absorbing
-
-        initial_synthetic_waveform = self.synthetic_waveform
-        initial_wavefield_forward  = self.wavefield_forward     
-        velocity_model_handler     = self.velocity_model_handler
-        sim_time_handler           = self.sim_time_handler
-        grid_handler               = self.grid_handler
-        source_handler             = self.source_handler
-        receiver_handler           = self.receiver_handler
-
-        observed_time              = self.observed_time
-        observed_waveform          = self.observed_waveform
-        misfit_interval            = self.misfit_interval
-
-        initial_misfit             = self.compute_misfit(
-            observed_waveform   = observed_waveform,
-            synthetic_waveform  = initial_synthetic_waveform,
-            misfit_interval     = misfit_interval
+ 
+        # ------------------------------------------------------------------
+        # 0) OPTIONAL: SHRINK GRID IF GOUGE SHRUNK (must happen BEFORE we cache locals)
+        # ------------------------------------------------------------------
+        (
+            self.assembly_dict,
+            new_idx_dict,
+            new_x,
+            new_v,
+            new_a,
+            new_src_sp,
+            new_rcv_sp,
+            removed_idx,
+        ) = shrink_grid_if_gouge_shrinks(
+            assembly_dict=self.assembly_dict,
+            idx_dict=self.velocity_model_handler.idx_dict,
+            spatial_axis=self.grid_handler.spatial_axis,
+            dx=self.grid_handler.dx,
+            velocity_model=self.velocity_model_handler.velocity_array,
+            damping_model=self.velocity_model_handler.damping_array,
+            source_spatial_function=self.source_handler.spatial_function,
+            receiver_spatial_function=self.receiver_handler.spatial_function,
         )
 
-        print(f"Initial misfit: {initial_misfit}")
+        if removed_idx.size > 0:
+            # Apply updates back into handlers
+            self.grid_handler.spatial_axis = new_x
+            self.grid_handler.total_grid_points = new_x.size
 
-        # Basic references
-        num_x           = grid_handler.total_grid_points
-        delta_x         = grid_handler.dx
-        delta_t         = sim_time_handler.dt
-        num_t           = sim_time_handler.num_t
-        simulation_time = sim_time_handler.simulation_time
-        spatial_axis    = grid_handler.spatial_axis
+            self.velocity_model_handler.velocity_array = new_v
+            self.velocity_model_handler.damping_array  = new_a
+            self.velocity_model_handler.idx_dict       = new_idx_dict
+            self.velocity_model_handler.x              = new_x
+            self.source_handler.spatial_function   = new_src_sp
+            self.receiver_handler.spatial_function = new_rcv_sp
 
-        # Initialize the inversion variables 
-        initial_source_time_function        = source_handler.time_function.copy()
-        initial_source_spatial_function     = source_handler.spatial_function.copy()
-        initial_receiver_spatial_function   = receiver_handler.spatial_function.copy()
-        initial_velocity_model              = velocity_model_handler.velocity_array.copy()
-        initial_damping_model               = velocity_model_handler.damping_array.copy()
-        idx_dict                            = velocity_model_handler.idx_dict
+        # ------------------------------------------------------------------
+        # 1) RE-BIND ALL locals from handlers AFTER shrink (critical)
+        # ------------------------------------------------------------------
+        # Basic references (must be refreshed)
+        absorbing       = self.absorbing
 
-        # Regions where velocity is allowed to update
-        if self.geometry_type == "dds": 
-            # regions_to_update = np.arange(num_x)
+        observed_time   = self.observed_time
+        observed_waveform =  self.observed_waveform
+        misfit_interval = self.misfit_interval
+        num_x           = self.grid_handler.total_grid_points
+        delta_x         = self.grid_handler.dx
+        delta_t         = self.sim_time_handler.dt
+        num_t           = self.sim_time_handler.num_t
+        simulation_time = self.sim_time_handler.simulation_time
+        spatial_axis    = self.grid_handler.spatial_axis
+
+        # Inversion variables (must be refreshed)
+        initial_source_time_function      = self.source_handler.time_function.copy()       # time axis unchanged
+        initial_source_spatial_function   = self.source_handler.spatial_function.copy()    # may have shrunk
+        initial_receiver_spatial_function = self.receiver_handler.spatial_function.copy()  # may have shrunk
+        initial_velocity_model            = self.velocity_model_handler.velocity_array.copy()
+        initial_damping_model             = self.velocity_model_handler.damping_array.copy()
+        idx_dict                          = self.velocity_model_handler.idx_dict           # must be refreshed
+
+        # ------------------------------------------------------------------
+        # 2) Regions-to-update computed using UPDATED idx_dict
+        # ------------------------------------------------------------------
+        if self.geometry_type == "dds":
             regions_to_update = np.concatenate([
-                # idx_dict["pzt_1"],
-                idx_dict["groove_sb1"], 
+                idx_dict["groove_sb1"],
                 idx_dict["gouge_1"],
                 idx_dict["groove_cb1"],
                 idx_dict["groove_cb2"],
                 idx_dict["gouge_2"],
                 idx_dict["groove_sb2"],
-                # idx_dict["pzt_2"]
             ])
-            
-            grooves = np.concatenate([
-                idx_dict["groove_sb1"], 
-                idx_dict["groove_cb1"],
-                idx_dict["groove_cb2"],
-                idx_dict["groove_sb2"]
-                                ])
-            
-            gouge = np.concatenate([idx_dict["gouge_1"], idx_dict["gouge_2"]])
-
         elif self.geometry_type == "block":
             regions_to_update = np.concatenate([
                 idx_dict["pzt_1"],
@@ -553,10 +568,61 @@ class UltrasonicModeler:
                 idx_dict["pzt_2"]
             ])
 
-        stf_duration_idx  = np.where(initial_source_time_function!=0)[-1][-1]
-        stf_extension_idx = np.where(initial_source_spatial_function!=0)[-1][-1]
-        rx_extension_idx  = np.where(initial_receiver_spatial_function!=0)[0][0]
+        # Indices depending on spatial functions must also be recomputed AFTER shrink
+        stf_duration_idx  = np.where(simulation_time < stf_duration)[0][-1]
+        stf_extension_idx = np.where(initial_source_spatial_function != 0)[0][-1]
+        rx_extension_idx  = np.where(initial_receiver_spatial_function != 0)[0][0]
 
+        # ------------------------------------------------------------------
+        # 3) Recompute INITIAL forward + INITIAL synthetic + INITIAL misfit once
+        # ------------------------------------------------------------------
+        initial_wavefield_forward = pseudospectral_1D_damped(
+            num_x=num_x,
+            delta_x=delta_x,
+            num_t=num_t,
+            delta_t=delta_t,
+            source_spatial_function=initial_source_spatial_function,
+            source_time_function=initial_source_time_function,
+            velocity_model=initial_velocity_model,
+            damping_model=initial_damping_model,
+            absorbing=absorbing,
+        )
+
+        initial_simulated_waveform = np.sum(
+            initial_wavefield_forward * initial_receiver_spatial_function, axis=1
+        )
+        initial_synthetic_waveform = np.interp(observed_time, simulation_time, initial_simulated_waveform)
+
+        # Apply the same reflection scaling logic, but using INITIAL variables (not "updated_*")
+        if not is_compact(misfit_interval):
+            gaps     = np.where(np.diff(np.sort(misfit_interval)) > 1)[0]
+            segments = np.split(np.sort(misfit_interval), gaps + 1)
+            direct, reflect = segments[0], segments[1]
+            A0 = np.sum(np.abs(observed_waveform[direct]))
+            A1 = np.sum(np.abs(observed_waveform[reflect]))
+            if A0 > 0:
+                initial_synthetic_waveform[reflect] *= (A1 / A0)
+
+        # Normalize (INITIAL)
+        if normalize_waveform and np.max(initial_synthetic_waveform) != 0:
+            if self.geometry_type == "block":
+                initial_synthetic_waveform *= (
+                    np.amax(np.abs(observed_waveform[misfit_interval])) /
+                    np.amax(np.abs(initial_synthetic_waveform[misfit_interval]))
+                )
+            elif self.geometry_type == "dds":
+                initial_synthetic_waveform *= (
+                    np.sum(np.abs(observed_waveform[misfit_interval])) /
+                    np.sum(np.abs(initial_synthetic_waveform[misfit_interval]))
+                )
+
+        initial_misfit = self.compute_misfit(
+            observed_waveform=observed_waveform,
+            synthetic_waveform=initial_synthetic_waveform,
+            misfit_interval=misfit_interval
+        )
+
+        # print(f"Initial misfit: {initial_misfit}")
         # -----------------------------------------------------------------------
         # Store "best" parameters at iteration 0
         # -----------------------------------------------------------------------
@@ -596,7 +662,8 @@ class UltrasonicModeler:
 
         # 1‑D interpolation as a sparse matrix (much faster than np.interp)
         row  = np.arange(simulation_time.size)
-        col  = np.searchsorted(observed_time, simulation_time)
+        col = np.searchsorted(observed_time, simulation_time)
+        col = np.clip(col, 0, observed_time.size - 1)
         data = np.ones_like(row, dtype=float)
         interp_mat = csr_matrix((data, (row, col)), shape=(row.size, observed_time.size))
 
@@ -605,7 +672,7 @@ class UltrasonicModeler:
         activate_damping  = True
         activate_velocity = True
         for iteration in range(n_iterations):
-            print(f"Iteration {iteration + 1}/{n_iterations}")
+            # print(f"Iteration {iteration + 1}/{n_iterations}")
             
             # Prepare updated arrays from 'best'
             updated_velocity_model            = best_velocity_model.copy()
@@ -677,21 +744,12 @@ class UltrasonicModeler:
                 step_size_vel = dc_max / (max_vel_grad + 1e-15)
                 updated_velocity_model[regions_to_update] -= step_size_vel * gradient_vel[regions_to_update]
 
-                # updated_velocity_model[grooves] = np.clip(updated_velocity_model[grooves],
-                #                                           a_min=None,
-                #                                           a_max=updated_velocity_model[idx_dict["central_block"]][0])
 
             if da_max and activate_damping:
                 # -- update velocity only in the selected region --
                 step_size_damp = da_max / (max_damp_grad + 1e-15)
                 updated_damping_model[regions_to_update] -= step_size_damp * gradient_damp[regions_to_update]
 
-                # updated_damping_model[grooves] = np.clip(updated_damping_model[grooves],
-                #                                           a_min=updated_damping_model[idx_dict["central_block"]][0],
-                #                                           a_max=None)
-
-                # plt.plot(updated_damping_model)
-                # plt.show()
             if dw_max:
                 # -- update wavelet w(t) --
                 step_size_w   = dw_max / (max_w_grad + 1e-15)
@@ -757,7 +815,7 @@ class UltrasonicModeler:
                 synthetic_waveform=updated_synthetic_waveform,
                 misfit_interval=misfit_interval
             )
-            print(f"    Updated Misfit: {updated_misfit}")
+            # print(f"    Updated Misfit: {updated_misfit}")
 
             # -------------------------------------------------------------------
             # Accept or reject
@@ -786,19 +844,19 @@ class UltrasonicModeler:
                 da_max /= reduce_factor
                 dw_max /= reduce_factor
                 ds_max /= reduce_factor
-                print(f"    ✗ No improvement. Reverting & reducing step")
+                # print(f"    ✗ No improvement. Reverting & reducing step")
 
             #-------------------------------------
             # evaluate if stop the processing
             #------------------------------------
             # Check threshold
             if (ds_max < ds_threshold) or (dw_max < dw_threshold):
-                print("Step size dropped below threshold; stopping.")
+                # print("Step size dropped below threshold; stopping.")
                 break
 
             if (updated_misfit > best_misfit) and (abs(previous_misfit-updated_misfit) < misfit_threshold):
                 if end_of_the_game:
-                    print("Misfit updating is below threshold. Stopping!")
+                    # print("Misfit updating is below threshold. Stopping!")
                     break
 
             previous_misfit = updated_misfit
@@ -872,7 +930,6 @@ class UltrasonicModeler:
         #     )
     
 # ------------------------------------------------------------------
-import numpy as np
 
 def pseudospectral_1D_damped(
     num_x: int,
@@ -949,6 +1006,10 @@ def pseudospectral_1D_damped(
     u_past = np.zeros(N_ext, dtype=np.float64)
     u_curr = np.zeros(N_ext, dtype=np.float64)
     u_fut  = np.zeros(N_ext, dtype=np.float64)
+    du_curr  = np.zeros(N_ext, dtype=np.float64)
+    du_past  = np.zeros(N_ext, dtype=np.float64)
+    ux_half  = np.zeros(N_ext, dtype=np.float64)
+    uxt_half  = np.zeros(N_ext, dtype=np.float64)
 
     # flux q on half-grid: indices 0..N_ext-2 represent i+1/2
     q_half = np.zeros(N_ext - 1, dtype=np.float64)
@@ -1012,7 +1073,6 @@ def pseudospectral_1D_damped(
     return wave_out
 
 #########################################################################
-import numpy as np
 from numpy.fft import rfft, irfft   # real FFT → half the work
 
 # ------------------------------------------------------------------
@@ -1062,7 +1122,6 @@ def compute_time_derivatives(wavefield_out, delta_t):
 ########################################
 # JIT KERNEL FOR FASTER COMPUTATION
 #######################################
-import numpy as np
 from numba import njit, prange
 # ------------------------------------------------------------
 # Spatial Laplacian  ∂²u/∂x²   (shape = (num_t, num_x))
@@ -1156,3 +1215,145 @@ def extend_model(original_model, N_pad):
 def sigmoid(z):
     return 1/(1 + np.exp(-z))
 
+#####################################################
+# HELPER FOR RESHAPING GRID IF LAYER THICKNESS SHRINK
+####################################################
+def shrink_grid_if_gouge_shrinks(
+    *,
+    assembly_dict: Dict[str, Any],
+    idx_dict: Dict[str, np.ndarray],
+    spatial_axis: np.ndarray,
+    dx: float,
+    velocity_model: np.ndarray,
+    damping_model: Optional[np.ndarray],
+    source_spatial_function: np.ndarray,
+    receiver_spatial_function: np.ndarray,
+    snap_thickness_to_grid: bool = True,
+) -> Tuple[
+    Dict[str, Any],              # updated assembly_dict (sample_dimensions may be snapped)
+    Dict[str, np.ndarray],       # updated idx_dict
+    np.ndarray,                  # new spatial_axis
+    np.ndarray,                  # new velocity_model
+    Optional[np.ndarray],        # new damping_model
+    np.ndarray,                  # new source_spatial_function
+    np.ndarray,                  # new receiver_spatial_function
+    np.ndarray,                  # removed_indices (old-grid indices removed)
+]:
+    """
+    Shrink the 1D grid ONLY if gouge thickness decreased, keeping dx constant.
+
+    Mechanism:
+      - new N_gouge_i = round(thickness_i / dx)
+      - if new < old:
+          * remove (old-new) points from gouge_1 at its RIGHT end (adjacent to central block)
+          * remove (old-new) points from gouge_2 at its LEFT end (adjacent to central block)
+
+    Then delete those indices from all arrays and update idx_dict accordingly.
+
+    IMPORTANT:
+      - This preserves dx and dt assumptions; you must ensure your time axis uses fixed dt elsewhere.
+      - After shrinking, you should run ONE forward solve to refresh wavefield/synthetic before the inversion loop.
+    """
+
+    # --------------------------- guards ---------------------------
+    if "gouge_1" not in idx_dict or "gouge_2" not in idx_dict:
+        raise ValueError("idx_dict must contain 'gouge_1' and 'gouge_2' keys.")
+
+    n_old = spatial_axis.size
+    if velocity_model.size != n_old:
+        raise ValueError("velocity_model length must match spatial_axis length.")
+    if damping_model is not None and damping_model.size != n_old:
+        raise ValueError("damping_model length must match spatial_axis length.")
+    if source_spatial_function.size != n_old:
+        raise ValueError("source_spatial_function length must match spatial_axis length.")
+    if receiver_spatial_function.size != n_old:
+        raise ValueError("receiver_spatial_function length must match spatial_axis length.")
+
+    sd = list(assembly_dict["sample_dimensions"])  # [side1, gouge1, central, gouge2, side2]
+    h1 = float(sd[1])
+    h2 = float(sd[3])
+
+    g1 = np.asarray(idx_dict["gouge_1"], dtype=int)
+    g2 = np.asarray(idx_dict["gouge_2"], dtype=int)
+
+    n1_old = g1.size
+    n2_old = g2.size
+
+    n1_new = max(1, int(np.rint(h1 / dx)))
+    n2_new = max(1, int(np.rint(h2 / dx)))
+
+    # Only act on shrink (your requirement)
+    if n1_new >= n1_old and n2_new >= n2_old:
+        return (
+            assembly_dict, idx_dict, spatial_axis,
+            velocity_model, damping_model,
+            source_spatial_function, receiver_spatial_function,
+            np.array([], dtype=int)
+        )
+
+    # Optionally snap thickness to exact grid multiple (recommended for consistency)
+    if snap_thickness_to_grid:
+        sd[1] = n1_new * dx
+        sd[3] = n2_new * dx
+        assembly_dict["sample_dimensions"] = sd
+
+    # ---------------------- choose indices to remove ----------------------
+    remove_idx = []
+
+    # gouge_1: remove at RIGHT end (near central block boundary)
+    r1 = max(0, n1_old - n1_new)
+    if r1 > 0:
+        remove_idx.append(g1[-r1:])
+
+    # gouge_2: remove at LEFT end (near central block boundary)
+    r2 = max(0, n2_old - n2_new)
+    if r2 > 0:
+        remove_idx.append(g2[:r2])
+
+    removed = np.unique(np.concatenate(remove_idx)).astype(int)
+    removed.sort()
+
+    if removed.size == 0:
+        return (
+            assembly_dict, idx_dict, spatial_axis,
+            velocity_model, damping_model,
+            source_spatial_function, receiver_spatial_function,
+            removed
+        )
+
+    # ---------------------- delete indices from arrays ----------------------
+    spatial_axis_new = np.delete(spatial_axis, removed)
+    velocity_new     = np.delete(velocity_model, removed)
+    damping_new      = None if damping_model is None else np.delete(damping_model, removed)
+    src_sp_new       = np.delete(source_spatial_function, removed)
+    rcv_sp_new       = np.delete(receiver_spatial_function, removed)
+
+    # ---------------------- rebuild idx_dict via mapping ----------------------
+    # Create a mapping old_index -> new_index using a mask
+    keep_mask = np.ones(n_old, dtype=bool)
+    keep_mask[removed] = False
+    old_to_new = -np.ones(n_old, dtype=int)
+    old_to_new[keep_mask] = np.arange(keep_mask.sum(), dtype=int)
+
+    idx_new: Dict[str, np.ndarray] = {}
+    for k, arr in idx_dict.items():
+        a = np.asarray(arr, dtype=int)
+        # keep only indices not removed
+        a = a[keep_mask[a]]
+        # remap
+        a = old_to_new[a]
+        # clean
+        a = a[a >= 0]
+        idx_new[k] = a
+
+    print("shrinking")
+    return (
+        assembly_dict,
+        idx_new,
+        spatial_axis_new,
+        velocity_new,
+        damping_new,
+        src_sp_new,
+        rcv_sp_new,
+        removed
+    )

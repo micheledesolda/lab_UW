@@ -116,8 +116,8 @@ class VelocityModel1DBase(ABC):
         Thickness of the PZT layer(s).
     pla_layer_width : float
         Thickness of the PLA layer(s).
-    steel_velocity : float
-        Velocity used for steel regions.
+    block_velocity : float
+        Velocity used for block regions.
     pzt_velocity : float
         Velocity used for PZT regions.
     pla_velocity : float
@@ -141,7 +141,7 @@ class VelocityModel1DBase(ABC):
         sample_dimensions: Tuple[float, ...],
         pzt_layer_width: float,
         pla_layer_width: float,
-        steel_velocity: float,
+        block_velocity: dict,
         pzt_velocity: float,
         pla_velocity: float,
         outfile_path: Optional[Path] = None
@@ -152,7 +152,16 @@ class VelocityModel1DBase(ABC):
         self.pzt_layer_width = pzt_layer_width
         self.pla_layer_width = pla_layer_width
 
-        self.steel_velocity = steel_velocity
+        if isinstance(block_velocity, dict):
+            self.block_velocity_side1 = float(block_velocity["side1"])
+            self.block_velocity_central = float(block_velocity["central"])
+            self.block_velocity_side2 = float(block_velocity["side2"])
+        else:
+            # backward compatible
+            self.block_velocity_side1 = float(block_velocity)
+            self.block_velocity_central = float(block_velocity)
+            self.block_velocity_side2 = float(block_velocity)
+
         self.pzt_velocity   = pzt_velocity
         self.pla_velocity   = pla_velocity
 
@@ -212,7 +221,7 @@ class VelocityModel1DBase(ABC):
 class VelocityModel1D_SingleBlock(VelocityModel1DBase):
     """
     Single-block 1D velocity model:
-      PLA -> PZT -> STEEL_BLOCK -> PZT -> PLA
+      PLA -> PZT -> BLOCK -> PZT -> PLA
     with the 'apply_smoothing(region_from, region_to, n_smooth)' approach.
     """
 
@@ -224,7 +233,7 @@ class VelocityModel1D_SingleBlock(VelocityModel1DBase):
         x_receiver: float,
         pzt_layer_width: float,
         pla_layer_width: float,
-        steel_velocity: float,
+        block_velocity: float,
         pzt_velocity: float,
         pla_velocity: float,
         plotting: bool = False,
@@ -235,7 +244,7 @@ class VelocityModel1D_SingleBlock(VelocityModel1DBase):
             sample_dimensions=sample_dimensions,
             pzt_layer_width=pzt_layer_width,
             pla_layer_width=pla_layer_width,
-            steel_velocity=steel_velocity,
+            block_velocity=block_velocity,
             pzt_velocity=pzt_velocity,
             pla_velocity=pla_velocity,
             outfile_path=outfile_path
@@ -266,20 +275,20 @@ class VelocityModel1D_SingleBlock(VelocityModel1DBase):
 
     def compute_layer_positions(self):
         """
-        [PLA, PZT, STEEL_BLOCK, PZT, PLA].
-        Possibly adjust steel length by x_transmitter/x_receiver if desired.
+        [PLA, PZT, BLOCK, PZT, PLA].
+        Possibly adjust block length by x_transmitter/x_receiver if desired.
         """
         if len(self.sample_dimensions) != 1:
             raise ValueError("Expected exactly 1 item in sample_dimensions for single-block model.")
 
         block_total_length = self.sample_dimensions[0]
-        # steel_length = block_total_length - (self.x_transmitter + self.x_receiver)
-        steel_length = block_total_length
+        # block_length = block_total_length - (self.x_transmitter + self.x_receiver)
+        block_length = block_total_length
 
         self.layer_thicknesses = [
             self.pla_layer_width,
             self.pzt_layer_width,
-            steel_length,
+            block_length,
             self.pzt_layer_width,
             self.pla_layer_width
         ]
@@ -287,7 +296,7 @@ class VelocityModel1D_SingleBlock(VelocityModel1DBase):
 
     def define_region_indices(self):
         x = self.x
-        regions = ["pla_1", "pzt_1", "steel_block", "pzt_2", "pla_2"]
+        regions = ["pla_1", "pzt_1", "block", "pzt_2", "pla_2"]
         self.idx_dict.clear()
         for i, region in enumerate(regions):
             start = self.layer_starts[i]
@@ -296,7 +305,7 @@ class VelocityModel1D_SingleBlock(VelocityModel1DBase):
             self.idx_dict[region] = idx
 
     def initialize_velocity_array(self):
-        self.velocity_array = self.steel_velocity * np.ones_like(self.x)
+        self.velocity_array = self.block_velocity * np.ones_like(self.x)
 
     def initialize_damping_array(self):
         self.damping_array = np.zeros_like(self.x)
@@ -304,7 +313,7 @@ class VelocityModel1D_SingleBlock(VelocityModel1DBase):
     def assign_velocities(self):
         self.assign_constant_velocity("pla_1",       self.pla_velocity)
         self.assign_constant_velocity("pzt_1",       self.pzt_velocity)
-        self.assign_constant_velocity("steel_block", self.steel_velocity)
+        self.assign_constant_velocity("block", self.block_velocity)
         self.assign_constant_velocity("pzt_2",       self.pzt_velocity)
         self.assign_constant_velocity("pla_2",       self.pla_velocity)
 
@@ -319,7 +328,7 @@ class VelocityModel1D_SingleBlock(VelocityModel1DBase):
         region_velocity_map = {
             "pla_1":       self.pla_velocity,
             "pzt_1":       self.pzt_velocity,
-            "steel_block": self.steel_velocity,
+            "block":       self.block_velocity,
             "pzt_2":       self.pzt_velocity,
             "pla_2":       self.pla_velocity
         }
@@ -388,7 +397,7 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         pla_layer_width: float,
         h_groove_side: float,
         h_groove_central: float,
-        steel_velocity: float,
+        block_velocity: float,
         # Gouge velocity can be a tuple of floats or arrays: (gouge_1_vel, gouge_2_vel)
         gouge_velocity: Union[Tuple[float, float], Tuple[np.ndarray, np.ndarray]],
         gouge_damping : Union[Tuple[float, float], Tuple[np.ndarray, np.ndarray]],        
@@ -407,7 +416,16 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         self.h_groove_side    = h_groove_side
         self.h_groove_central = h_groove_central
 
-        self.steel_velocity = steel_velocity
+        if isinstance(block_velocity, dict):
+            self.block_velocity_side1 = float(block_velocity["side1"])
+            self.block_velocity_central = float(block_velocity["central"])
+            self.block_velocity_side2 = float(block_velocity["side2"])
+        else:
+            # backward compatible
+            self.block_velocity_side1 = float(block_velocity)
+            self.block_velocity_central = float(block_velocity)
+            self.block_velocity_side2 = float(block_velocity)
+
         self.gouge_velocity = gouge_velocity  # (gouge_1, gouge_2)
         self.gouge_damping  = gouge_damping  
         self.pzt_velocity   = pzt_velocity
@@ -452,7 +470,7 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         (side_block_1_total, gouge_1_length,
          central_block_total, gouge_2_length, side_block_2_total) = self.sample_dimensions
 
-        # Subtract the groove heights from each steel block portion
+        # Subtract the groove heights from each block portion
         side_block_1  = side_block_1_total - self.h_groove_side
         side_block_2  = side_block_2_total - self.h_groove_side
         central_block = central_block_total - 2.0 * self.h_groove_central
@@ -497,10 +515,36 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
             self.idx_dict[region] = indices
 
     def initialize_velocity_array(self):
-        '''
-        Initialize the velocity model with default velocities.
-        '''
-        self.velocity_array = self.steel_velocity * np.ones_like(self.x)
+        self.velocity_array = self.block_velocity_side1 * np.ones_like(self.x)
+
+    def assign_velocities(self):
+        self.assign_constant_velocity('pla_1', self.pla_velocity)
+        self.assign_constant_velocity('pzt_1', self.pzt_velocity)
+
+        # Explicit block assignments 
+        self.assign_constant_velocity('side_block_1', self.block_velocity_side1)
+        self.assign_constant_velocity('central_block', self.block_velocity_central)
+        self.assign_constant_velocity('side_block_2', self.block_velocity_side2)
+
+        # Grooves: ramp between the *correct* adjacent block and gouge
+        # self.assign_groove_velocity('groove_sb1', self.gouge_velocity[0], is_start=True,  block_velocity=self.block_velocity_side1)
+        self.assign_constant_velocity('groove_sb1', self.block_velocity_side1)
+
+        # self.assign_groove_velocity('groove_cb1', self.gouge_velocity[0], is_start=False, block_velocity=self.block_velocity_central)
+        self.assign_constant_velocity('groove_cb1', self.block_velocity_central)
+
+        # self.assign_groove_velocity('groove_cb2', self.gouge_velocity[1], is_start=True,  block_velocity=self.block_velocity_central)
+        self.assign_constant_velocity('groove_cb2', self.block_velocity_central)
+
+        # self.assign_groove_velocity('groove_sb2', self.gouge_velocity[1], is_start=False, block_velocity=self.block_velocity_side2)
+        self.assign_constant_velocity('groove_sb2', self.block_velocity_side2)
+
+        self.assign_gouge_velocity('gouge_1', self.gouge_velocity[0])
+        self.assign_gouge_velocity('gouge_2', self.gouge_velocity[1])
+
+        self.assign_constant_velocity('pzt_2', self.pzt_velocity)
+        self.assign_constant_velocity('pla_2', self.pla_velocity)
+
 
     def initialize_damping_array(self):
         '''
@@ -508,56 +552,26 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         '''
         self.damping_array = np.zeros_like(self.x)
 
-    def assign_velocities(self):
-        '''
-        Assign velocities to each region.
-        '''
-        self.assign_constant_velocity('pla_1', self.pla_velocity)
-        self.assign_constant_velocity('pzt_1', self.pzt_velocity)
-        # Side Block 1 remains steel_velocity
-
-        self.assign_groove_velocity('groove_sb1', self.gouge_velocity[0], is_start=True)
-        # self.assign_constant_velocity('groove_sb1', self.steel_velocity)
-
-        self.assign_gouge_velocity('gouge_1', self.gouge_velocity[0])
- 
-        self.assign_groove_velocity('groove_cb1', self.gouge_velocity[0], is_start=False)
-        # self.assign_constant_velocity('groove_cb1', self.steel_velocity)
-
-        self.assign_constant_velocity('central_block', self.steel_velocity)
-
-        self.assign_groove_velocity('groove_cb2', self.gouge_velocity[1], is_start=True)
-        # self.assign_constant_velocity('groove_cb2', self.steel_velocity)
-
-        self.assign_gouge_velocity('gouge_2', self.gouge_velocity[1])
-
-        self.assign_groove_velocity('groove_sb2', self.gouge_velocity[1], is_start=False)
-        # self.assign_constant_velocity('groove_sb2', self.steel_velocity)
-
-        # Side Block 2 remains steel_velocity
-        self.assign_constant_velocity('pzt_2', self.pzt_velocity)
-        self.assign_constant_velocity('pla_2', self.pla_velocity)
-
     def assign_damping(self):
         '''
         Assign damping to the guge region and the ramp to the grooves ones.
         '''
 
-        self.assign_groove_damping('groove_sb1', self.gouge_damping[0], is_start=True)
-        # self.assign_gouge_damping('groove_sb1', self.gouge_damping[0])
+        # self.assign_groove_damping('groove_sb1', self.gouge_damping[0], is_start=True)
+        self.assign_gouge_damping('groove_sb1', self.gouge_damping[0])
 
         self.assign_gouge_damping('gouge_1', self.gouge_damping[0])
 
-        self.assign_groove_damping('groove_cb1', self.gouge_damping[0], is_start=False)
-        # self.assign_gouge_damping('groove_cb1', self.gouge_damping[0])
+        # self.assign_groove_damping('groove_cb1', self.gouge_damping[0], is_start=False)
+        self.assign_gouge_damping('groove_cb1', self.gouge_damping[0])
 
         self.assign_gouge_damping('gouge_2', self.gouge_damping[1])
 
-        self.assign_groove_damping('groove_cb2', self.gouge_damping[1], is_start=True)
-        # self.assign_gouge_damping('groove_cb2', self.gouge_damping[1])
+        # self.assign_groove_damping('groove_cb2', self.gouge_damping[1], is_start=True)
+        self.assign_gouge_damping('groove_cb2', self.gouge_damping[1])
 
-        self.assign_groove_damping('groove_sb2', self.gouge_damping[1], is_start=False)
-        # self.assign_gouge_damping('groove_sb2', self.gouge_damping[1])
+        # self.assign_groove_damping('groove_sb2', self.gouge_damping[1], is_start=False)
+        self.assign_gouge_damping('groove_sb2', self.gouge_damping[1])
 
     def assign_constant_velocity(self, region_name: str, velocity: float):
         '''
@@ -600,7 +614,8 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
     def assign_groove_velocity(self,
                             region_name: str,
                             adjacent_velocity: Union[float, np.ndarray],
-                            is_start: bool):
+                            is_start: bool,
+                            block_velocity=None):
         """
         Same logic as your working version, but physically-motivated mapping:
         - build a linear fill fraction f across the groove
@@ -609,6 +624,8 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
 
         This is still a 1D effective model, but avoids the less-physical 'linear v' ramp.
         """
+        block_velocity = float(self.block_velocity_side1) if block_velocity is None else float(block_velocity)
+
         indices = self.idx_dict.get(region_name, [])
         if not indices.size:
             return
@@ -620,12 +637,12 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
             return
 
         # ---- keep your exact end-member selection logic ----
-        start_vel = float(self.steel_velocity) if is_start else float(
-            adjacent_velocity[-1] if isinstance(adjacent_velocity, np.ndarray) else adjacent_velocity
-        )
-        end_vel = float(
-            adjacent_velocity[0] if isinstance(adjacent_velocity, np.ndarray) else adjacent_velocity
-        ) if is_start else float(self.steel_velocity)
+        # ---- end-member selection using the passed block_velocity ----
+        v_adj_end = float(adjacent_velocity[-1]) if isinstance(adjacent_velocity, np.ndarray) else float(adjacent_velocity)
+        v_adj_start = float(adjacent_velocity[0]) if isinstance(adjacent_velocity, np.ndarray) else float(adjacent_velocity)
+
+        start_vel = block_velocity if is_start else v_adj_end
+        end_vel   = v_adj_start if is_start else block_velocity
 
         # ---- same orientation as np.linspace(start, end) ----
         f = np.linspace(0.0, 1.0, groove_length)
@@ -644,8 +661,8 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
                             is_start: bool):
         """
         Same logic as your working version, but consistent mixture model for Kelvin–Voigt nu.
-        Assumes steel damping baseline is 0 (your current convention).
-        If you want nonzero steel damping, set nu_steel accordingly.
+        Assumes block damping baseline is 0 (your current convention).
+        If you want nonzero block damping, set nu_block accordingly.
         """
         indices = self.idx_dict.get(region_name, [])
         if not indices.size:
@@ -683,8 +700,8 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
     #         self.velocity_array[indices] = adjacent_velocity[0] if isinstance(adjacent_velocity, np.ndarray) else adjacent_velocity
     #         return
 
-    #     start_vel = self.steel_velocity if is_start else (adjacent_velocity[-1] if isinstance(adjacent_velocity, np.ndarray) else adjacent_velocity)
-    #     end_vel = (adjacent_velocity[0] if isinstance(adjacent_velocity, np.ndarray) else adjacent_velocity) if is_start else self.steel_velocity
+    #     start_vel = self.block_velocity if is_start else (adjacent_velocity[-1] if isinstance(adjacent_velocity, np.ndarray) else adjacent_velocity)
+    #     end_vel = (adjacent_velocity[0] if isinstance(adjacent_velocity, np.ndarray) else adjacent_velocity) if is_start else self.block_velocity
 
     #     self.velocity_array[indices] = np.linspace(start_vel, end_vel, groove_length)
 
@@ -721,15 +738,13 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         region_velocity_map = {
             "pla_1":         self.pla_velocity,
             "pzt_1":         self.pzt_velocity,
-            "side_block_1":  self.steel_velocity,
-            "groove_sb1":    self.steel_velocity,
-            "gouge_1":       None,   # if it's array-based, or pick a float if you want
-            "groove_cb1":    self.steel_velocity,
-            "central_block": self.steel_velocity,
-            "groove_cb2":    self.steel_velocity,
-            "gouge_2":       None,
-            "groove_sb2":    self.steel_velocity,
-            "side_block_2":  self.steel_velocity,
+            "side_block_1":  self.block_velocity_side1,
+            "groove_sb1":    self.block_velocity_side1,
+            "groove_cb1":    self.block_velocity_central,
+            "central_block": self.block_velocity_central,
+            "groove_cb2":    self.block_velocity_central,
+            "groove_sb2":    self.block_velocity_side2,
+            "side_block_2":  self.block_velocity_side2,
             "pzt_2":         self.pzt_velocity,
             "pla_2":         self.pla_velocity
         }
