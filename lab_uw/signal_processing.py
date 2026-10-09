@@ -4,8 +4,6 @@ import numpy as np
 from typing import Tuple, List, Optional
 from math import ceil
 
-from lab_uw.plotting import Plotter
-
 class SignalProcessor:
     """
     A collection of signal processing functions for waveform data.
@@ -138,7 +136,6 @@ class SignalProcessor:
         metadata: dict,
         freq_cut: float = 5.0,
         transition_width: float = 1,
-        plotting = False,
         outfile_path: Optional[str] = None
     ) -> Tuple[np.ndarray, np.ndarray]:
         '''
@@ -149,7 +146,6 @@ class SignalProcessor:
             metadata (dict): Metadata containing 'sampling_rate' and 'time_ax_waveform'.
             freq_cut (float): Frequency cutoff for the low-pass filter in Hz.
             transition_width (float): Width of the transition region around the cutoff frequency in Hz.
-            plot_debug (bool): If True, plots the filter and spectra for debugging.
 
         Returns:
             Tuple[np.ndarray, np.ndarray]: Filtered signal and reconstructed noise arrays.
@@ -173,8 +169,10 @@ class SignalProcessor:
         if sampling_rate <= 0:
             raise ValueError("sampling_rate must be a positive number.")
 
+
         # Ensure waveform_data is 2D
-        if waveform_data.ndim == 1:
+        input_was_1d = waveform_data.ndim == 1
+        if input_was_1d:
             waveform_data = waveform_data[np.newaxis, :]
 
         n_waveforms, n_samples = waveform_data.shape
@@ -182,8 +180,12 @@ class SignalProcessor:
         # Compute frequency axis
         freqs = np.fft.fftfreq(n_samples, d=sampling_rate)
 
-        # Create low-pass filter mask using the updated lowpass_mask function
-        lowpass_filter = SignalProcessor.lowpass_mask(freqs, freq_cut, transition_width=transition_width)
+        # Create low-pass filter mask
+        lowpass_filter = SignalProcessor.lowpass_mask(
+            freqs,
+            freq_cut,
+            transition_width=transition_width
+        )
 
         # Apply the mask to the FFT of the data
         fft_data = np.fft.fft(waveform_data, axis=1)
@@ -196,40 +198,11 @@ class SignalProcessor:
         noise = waveform_data - filtered_signal
 
         # Squeeze the output if input was 1D
-        filtered_signal = filtered_signal.squeeze()
-        noise = noise.squeeze()
-
-        if plotting:
-            plotter = Plotter()
-
-            if n_waveforms == 1:
-                amp_spectrum = np.abs(fft_data.squeeze())
-                phase_spectrum = np.angle(fft_data.squeeze())
-                filtered_amp_spectrum = np.abs(filtered_fft.squeeze())
-                plotter.filtered_amp_and_phase_spectrum_plot(signal_freqs=freqs,
-                                                             amp_spectrum=amp_spectrum,
-                                                             phase_spectrum=phase_spectrum,
-                                                             filtered_amp_spectrum=filtered_amp_spectrum,
-                                                             lowpass_filter=lowpass_filter,
-                                                             freq_cut=freq_cut,
-                                                             outfile_path=outfile_path)
-            
-            else:
-                filtered_amp_spectrum = np.abs(filtered_fft)
-                plotter.amplitude_spectrum_map(signal_freqs=freqs,
-                                            amp_spectrum=filtered_amp_spectrum,
-                                            metadata=metadata,
-                                            freq_cut = freq_cut,
-                                            outfile_path=outfile_path)
-                
-                plotter.amplitude_spectrum_distribution(signal_freqs=freqs,
-                                            amp_spectrum=filtered_amp_spectrum,
-                                            metadata=metadata,
-                                            freq_cut = freq_cut,
-                                            outfile_path=outfile_path + "_distribution")
+        if input_was_1d:
+            filtered_signal = filtered_signal.squeeze()
+            noise = noise.squeeze()
 
         return filtered_signal, noise
-
     @staticmethod
     def sta_lta(
         waveform: np.ndarray,

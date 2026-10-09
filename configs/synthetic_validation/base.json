@@ -1,0 +1,105 @@
+{
+  "name": "base",
+  "description": "Shared numerical and geometrical settings for known-model DDS validation.",
+  "wave_type": "_p",
+  "output_directory": "../../synthetic_validation_results",
+  "time": {
+    "dt_us": 0.01,
+    "duration_us": 8.0
+  },
+  "stf": {
+    "kind": "analytic",
+    "dt_us": 0.005,
+    "duration_us": 1.5,
+    "frequency_mhz": 1.5,
+    "decay_per_us": 2.5
+  },
+  "physics": {
+    "frequency_min_mhz": 0.2,
+    "frequency_cutoff_mhz": 2.5,
+    "minimum_velocity_cm_us": 0.15,
+    "maximum_velocity_cm_us": 0.62,
+    "boundary_condition": "free",
+    "source_injection": "body_force",
+    "receiver_quantity": "velocity",
+    "source_receiver_config": {
+      "interpolation_radius_cells": 4,
+      "source_extension_cm": 0.0,
+      "receiver_extension_cm": 0.0,
+      "source_normalization": "integral",
+      "receiver_normalization": "sum",
+      "spatial_boundary_mode": "truncate"
+    }
+  },
+  "geometry": {
+    "sample_dimensions_cm": [0.5, 0.05, 0.8, 0.05, 0.5],
+    "groove_side_cm": 0.025,
+    "groove_central_cm": 0.025,
+    "block_velocity_cm_us": {
+      "side1": 0.57,
+      "central": 0.57,
+      "side2": 0.57
+    },
+    "block_density_g_cm3": {
+      "side1": 7.8,
+      "central": 7.8,
+      "side2": 7.8
+    }
+  },
+  "truth_model": {
+    "gouge_velocity_cm_us": [0.2, 0.2],
+    "gouge_damping_cm2_us": [0.0006, 0.0006],
+    "gouge_density_g_cm3": [2.4, 2.4],
+    "gouge_thickness_cm": [0.05, 0.05]
+  },
+  "initial_model": {
+    "gouge_velocity_cm_us": [0.19, 0.19],
+    "gouge_damping_cm2_us": [0.0004, 0.0004],
+    "gouge_density_g_cm3": [2.1, 2.1],
+    "gouge_thickness_cm": [0.05, 0.05]
+  },
+  "numerics": {
+    "truth_points_per_wavelength": 32,
+    "inversion_points_per_wavelength": 16
+  },
+  "direct_window": {
+    "pre_padding_us": 0.15,
+    "post_padding_us": 0.35
+  },
+  "noise": {
+    "relative_rms": 0.0,
+    "seed": 8128
+  },
+  "inversion": {
+    "coarse_axes": {
+      "gouge_velocity_common": [0.17, 0.2, 0.23],
+      "gouge_damping_common": [0.0002, 0.0006, 0.001],
+      "gouge_density_common": [1.8, 2.4, 3.0]
+    },
+    "fine_points_per_axis": 3,
+    "bounds": {
+      "gouge_velocity_common": [0.12, 0.3],
+      "gouge_damping_common": [0.0, 0.002],
+      "gouge_density_common": [1.2, 4.0]
+    },
+    "equivalent_relative_tolerance": 0.02,
+    "equivalent_absolute_tolerance": 1e-8,
+    "local": {
+      "enabled": true,
+      "iterations": 4,
+      "velocity_step_cm_us": 0.002,
+      "velocity_threshold_cm_us": 0.00002,
+      "damping_step_cm2_us": 0.00003,
+      "damping_threshold_cm2_us": 3e-7,
+      "reduce_factor": 2.0,
+      "misfit_threshold": 1e-10,
+      "spectral_gamma": 1.0,
+      "taper_fraction": 0.0
+    }
+  },
+  "acceptance": {
+    "max_waveform_relative_l2": 0.05,
+    "max_travel_time_error_us": 0.08,
+    "max_active_parameter_relative_error": 0.2
+  }
+}

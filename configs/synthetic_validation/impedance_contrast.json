@@ -1,0 +1,10 @@
+{
+  "extends": "base.json",
+  "name": "impedance_contrast",
+  "description": "Two identical low-impedance gouge layers embedded between steel blocks.",
+  "truth_model": {
+    "gouge_velocity_cm_us": [0.2, 0.2],
+    "gouge_damping_cm2_us": [0.0006, 0.0006],
+    "gouge_density_g_cm3": [2.4, 2.4]
+  }
+}

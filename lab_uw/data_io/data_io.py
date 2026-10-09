@@ -6,15 +6,37 @@ import pandas as pd
 from scipy.signal import find_peaks
 
 import logging
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Iterator, Mapping, Optional, Union
 from pathlib import Path
 
-from lab_uw.data_io.schema import UWFrame
+from lab_uw.data_io.schema import MultiChannelUWFrame, UWFrame
 from lab_uw.data_io.readers.tsv_reader import read_tsv
 from lab_uw.data_io.readers.hdf5_reader import read_hdf5, read_stf_hdf5
 from lab_uw.data_io.writers.hdf5_writer import write_hdf5, write_stf_hdf5
 
 logger = logging.getLogger(__name__)
+
+
+class MultiChannelUltrasonicDataHandler:
+    """Channel-indexed handlers belonging to one recorded acquisition."""
+
+    def __init__(self, channels: Mapping[str, "UltrasonicDataHandler"], metadata: Dict = None):
+        self.channels = dict(channels)
+        self.metadata = {} if metadata is None else dict(metadata)
+        if not self.channels:
+            raise ValueError("At least one ultrasonic channel is required.")
+
+    def __getitem__(self, channel_name: str) -> "UltrasonicDataHandler":
+        return self.channels[channel_name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.channels)
+
+    def __len__(self) -> int:
+        return len(self.channels)
+
+    def items(self):
+        return self.channels.items()
 
 class UltrasonicDataHandler:
     """
@@ -31,8 +53,14 @@ class UltrasonicDataHandler:
 
     # --------- symmetric readers ----------
     @classmethod
-    def read_tsv(cls, path: Path) -> "UltrasonicDataHandler":
+    def read_tsv(cls, path: Path) -> Union["UltrasonicDataHandler", MultiChannelUltrasonicDataHandler]:
         f = read_tsv(path)
+        if isinstance(f, MultiChannelUWFrame):
+            channels = {
+                name: cls(frame.waveform_data, frame.metadata)
+                for name, frame in f.channels.items()
+            }
+            return MultiChannelUltrasonicDataHandler(channels, f.metadata)
         return cls(f.waveform_data, f.metadata)
 
     @classmethod
@@ -42,7 +70,7 @@ class UltrasonicDataHandler:
 
     # unified dispatcher (by suffix)
     @classmethod
-    def open(cls, path: Path, **h5_options) -> "UltrasonicDataHandler":
+    def open(cls, path: Path, **h5_options) -> Union["UltrasonicDataHandler", MultiChannelUltrasonicDataHandler]:
         ext = path.suffix.lower()
         if ext in {".tsv", ".txt"}:
             return cls.read_tsv(path)
@@ -52,7 +80,7 @@ class UltrasonicDataHandler:
 
     # --------- STF helpers (HDF5) ----------
     @classmethod
-    def read_stf_h5(cls, h5_path: Path, *, name: str, cycle_index: int = 0) -> "UltrasonicDataHandler":
+    def read_stf_hdf5(cls, h5_path: Path, *, name: str, cycle_index: int = 0) -> "UltrasonicDataHandler":
         """Read /stf/<name>/cycle_xxxxxx/source_waveform -> handler with (1, L)."""
         f = read_stf_hdf5(h5_path, name=name, cycle_index=cycle_index)
         return cls(f.waveform_data, f.metadata)
@@ -148,18 +176,180 @@ class UltrasonicDataHandler:
             self.frame.waveform_data[:, :idx] = 0.0
         return self
 
-    def lowpass(self, cutoff_mhz: Optional[float]) -> "UltrasonicDataHandler":
-        if cutoff_mhz:
-            from scipy.signal import butter, lfilter
-            def _butter_band(lowcut, highcut, fs, order=5):
-                from scipy.signal import butter
-                return butter(order, [lowcut, highcut], fs=fs, btype='band')
-            def _filt(data, lowcut, highcut, fs, order=5):
-                b, a = _butter_band(lowcut, highcut, fs, order=order)
-                return lfilter(b, a, data)
-            dt_us = float(self.metadata["sampling_rate"])
-            fs_mhz = 1.0 / dt_us
-            self.frame.waveform_data = _filt(self.frame.waveform_data, 0.25, cutoff_mhz, fs=fs_mhz)
+    def bandpass(
+        self,
+        freqmin: Optional[float] = None,
+        freqmax: Optional[float] = None,
+        order: int = 4,
+    ) -> "UltrasonicDataHandler":
+        """
+        Zero-phase Butterworth band-pass / high-pass / low-pass filter
+        applied along the waveform-sample axis.
+
+        Parameters
+        ----------
+        freqmin : float, optional
+            Lower cutoff frequency in MHz. If None, only the upper cutoff is used.
+        freqmax : float, optional
+            Upper cutoff frequency in MHz. If None, only the lower cutoff is used.
+        order : int
+            Filter order.
+
+        Returns
+        -------
+        UltrasonicDataHandler
+            self, for chaining.
+
+        Notes
+        -----
+        - Uses scipy.signal.sosfiltfilt for zero-phase filtering.
+        - metadata["sampling_rate"] is assumed to be the sampling interval in µs/sample.
+        """
+        if freqmin is None and freqmax is None:
+            return self
+
+        if "sampling_rate" not in self.metadata:
+            raise KeyError("metadata does not contain 'sampling_rate' key.")
+
+        dt_us = float(self.metadata["sampling_rate"])   # µs/sample
+        if dt_us <= 0:
+            raise ValueError("metadata['sampling_rate'] must be positive.")
+
+        fs_mhz = 1.0 / dt_us
+        nyq_mhz = 0.5 * fs_mhz
+
+        if order <= 0 or not isinstance(order, int):
+            raise ValueError("order must be a positive integer.")
+
+        if freqmin is not None:
+            freqmin = float(freqmin)
+            if freqmin <= 0:
+                raise ValueError("freqmin must be > 0.")
+            if freqmin >= nyq_mhz:
+                raise ValueError(f"freqmin must be < Nyquist ({nyq_mhz:.6g} MHz).")
+
+        if freqmax is not None:
+            freqmax = float(freqmax)
+            if freqmax <= 0:
+                raise ValueError("freqmax must be > 0.")
+            if freqmax >= nyq_mhz:
+                raise ValueError(f"freqmax must be < Nyquist ({nyq_mhz:.6g} MHz).")
+
+        if freqmin is not None and freqmax is not None:
+            if freqmin >= freqmax:
+                raise ValueError("freqmin must be smaller than freqmax.")
+            Wn = [freqmin, freqmax]
+            btype = "bandpass"
+        elif freqmin is not None:
+            Wn = freqmin
+            btype = "highpass"
+        else:
+            Wn = freqmax
+            btype = "lowpass"
+
+        from scipy.signal import butter, sosfiltfilt
+
+        y = np.asarray(self.frame.waveform_data)
+        input_was_1d = (y.ndim == 1)
+        if input_was_1d:
+            y = y[None, :]
+        elif y.ndim != 2:
+            raise ValueError(f"waveform_data must be 1D or 2D; got shape {y.shape}.")
+
+        sos = butter(order, Wn, btype=btype, fs=fs_mhz, output="sos")
+        y_filt = sosfiltfilt(sos, y, axis=-1)
+
+        self.frame.waveform_data = y_filt[0] if input_was_1d else y_filt
+        # Flat scalar provenance survives the existing HDF5 metadata writer
+        # and lets downstream reference modeling verify that the raw record
+        # and the already-filtered effective wavelet use the same pass band.
+        self.metadata["filter_type"] = btype
+        if freqmin is not None:
+            self.metadata["filter_freqmin_mhz"] = freqmin
+        else:
+            self.metadata.pop("filter_freqmin_mhz", None)
+        if freqmax is not None:
+            self.metadata["filter_freqmax_mhz"] = freqmax
+        else:
+            self.metadata.pop("filter_freqmax_mhz", None)
+        self.metadata["filter_order"] = int(order)
+        self.metadata["filter_zero_phase"] = True
+        return self
+
+    def select_by_time_ax_acquisition(
+        self,
+        *,
+        t_min_us: Optional[float] = None,
+        t_max_us: Optional[float] = None,
+        indices: Optional[np.ndarray] = None,
+        reset_t0: bool = False,
+    ) -> "UltrasonicDataHandler":
+        """
+        Select waveforms based on metadata['time_ax_acquisition'] (µs).
+
+        Modes:
+        1) Time window: keep rows whose acquisition time is within [t_min_us, t_max_us].
+        2) Explicit indices: keep the specified row indices (applied after time filtering if both provided).
+
+        Args:
+            t_min_us: Minimum acquisition time (inclusive). If None, no lower bound.
+            t_max_us: Maximum acquisition time (inclusive). If None, no upper bound.
+            indices: Optional explicit row indices to keep (after time filtering).
+            reset_t0: If True, subtract the first selected time from time_ax_acquisition.
+
+        Returns:
+            self (chainable)
+
+        Raises:
+            KeyError: if 'time_ax_acquisition' is missing from metadata.
+            ValueError: if time_ax_acquisition length mismatches waveform rows, or selection is empty.
+        """
+        if "time_ax_acquisition" not in self.metadata:
+            raise KeyError("metadata does not contain 'time_ax_acquisition' key.")
+
+        t = np.asarray(self.metadata["time_ax_acquisition"])
+        y = self.frame.waveform_data  # expected 2D (N, L)
+
+        if y.ndim != 2:
+            y = np.asarray(y)
+            if y.ndim == 1:
+                y = y[None, :]
+            else:
+                raise ValueError(f"waveform_data must be 1D or 2D; got shape {y.shape}.")
+
+        if t.shape[0] != y.shape[0]:
+            raise ValueError(
+                f"Length mismatch: time_ax_acquisition has {t.shape[0]} entries "
+                f"but waveform_data has {y.shape[0]} rows."
+            )
+
+        # --- build mask from time window ---
+        mask = np.ones(t.shape[0], dtype=bool)
+        if t_min_us is not None:
+            mask &= (t >= float(t_min_us))
+        if t_max_us is not None:
+            mask &= (t <= float(t_max_us))
+
+        sel = np.nonzero(mask)[0]
+
+        # --- optionally apply explicit indices (relative to original rows) ---
+        if indices is not None:
+            idx = np.asarray(indices, dtype=int).ravel()
+            # keep only those indices that also satisfy time mask
+            sel_set = set(sel.tolist())
+            sel = np.array([i for i in idx.tolist() if i in sel_set], dtype=int)
+
+        if sel.size == 0:
+            raise ValueError("Selection is empty: no waveforms match the requested criteria.")
+
+        # --- apply selection ---
+        self.frame.waveform_data = y[sel, :]
+        t_sel = t[sel]
+        if reset_t0:
+            t_sel = t_sel - t_sel[0]
+        self.metadata["time_ax_acquisition"] = t_sel
+        self.metadata["number_of_waveforms"] = int(self.frame.waveform_data.shape[0])
+
         return self
 
     # --------- spectra ----------

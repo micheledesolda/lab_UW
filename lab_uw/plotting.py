@@ -62,7 +62,7 @@ class Plotter:
     }
 
     SEMANTIC = {
-        'primary':      'gray1',     # <— new!
+        'primary':      'gray1',     # 
         'background':    'gray6',     # very light grey
         'axes_face':     'gray6',
 
@@ -300,7 +300,7 @@ class Plotter:
         signal_freqs: np.ndarray,
         amp_spectrum: np.ndarray,
         metadata: Dict,
-        freq_cut: float,
+        freq_max: float,
         outfile_path: Optional[str] = None
     ) -> None:
         """
@@ -314,7 +314,7 @@ class Plotter:
             Amplitude spectrum of shape (n_waveforms, n_samples).
         metadata : dict
             Metadata dictionary containing 'time_ax_acquisition'.
-        freq_cut : float
+        freq_max : float
             Maximum frequency to display on the y-axis (in MHz).
         outfile_path : str, optional
             Path to save the plot.
@@ -353,7 +353,7 @@ class Plotter:
             cmap=cmap,
             norm=mcolors.LogNorm(vmin=1e-3, vmax=amps.max())
         )
-        ax.set_ylim([0, freq_cut])
+        ax.set_ylim([0, freq_max])
 
         # colorbar
         cbar = fig.colorbar(pcm, pad=0.04)
@@ -404,7 +404,7 @@ class Plotter:
         signal_freqs: np.ndarray,
         amp_spectrum: np.ndarray,
         metadata: Dict,
-        freq_cut: float,
+        freq_max: float,
         outfile_path: Optional[str] = None
     ) -> None:
         """
@@ -419,7 +419,7 @@ class Plotter:
             Amplitude spectrum of shape (n_waveforms, n_samples).
         metadata : Dict
             Metadata dictionary containing 'time_ax_acquisition'.
-        freq_cut : float
+        freq_max : float
             Maximum frequency to display on the y-axis (in MHz).
         outfile_path : str, optional
             Path to save the resulting figure. If None, the figure is shown.
@@ -448,8 +448,8 @@ class Plotter:
         if len(time_ax_acquisition) != wave_num:
             raise ValueError("time_ax_acquisition length does not match amp_spectrum waveforms.")
 
-        # Mask to freq_cut
-        mask = freqs <= freq_cut
+        # Mask to freq_max
+        mask = freqs <= freq_max
         freqs_cut   = freqs[mask]
         amps_cut    = amps[:, mask]
 
@@ -487,7 +487,7 @@ class Plotter:
             fontsize=self.settings['fontsize_labels'],
             color=self.get_color('primary')
         )
-        axes[0].set_xlim([0, freq_cut])
+        axes[0].set_xlim([0, freq_max])
         axes[0].tick_params(
             axis='both',
             which='major',
@@ -505,7 +505,7 @@ class Plotter:
 
         num_freq_bins = 200
         num_amp_bins  = 200
-        freq_bins = np.linspace(0, freq_cut, num_freq_bins)
+        freq_bins = np.linspace(0, freq_max, num_freq_bins)
         amp_min, amp_max = amp_pos.min(), amp_pos.max()
         amp_bins = np.logspace(np.log10(amp_min), np.log10(amp_max), num_amp_bins)
 
@@ -536,7 +536,7 @@ class Plotter:
             fontsize=self.settings['fontsize_labels'],
             color=self.get_color('primary')
         )
-        axes[1].set_xlim([0, freq_cut])
+        axes[1].set_xlim([0, freq_max])
         axes[1].set_ylim([amp_min, amp_max])
         axes[1].tick_params(
             axis='both',
@@ -579,7 +579,7 @@ class Plotter:
             fontsize=self.settings['fontsize_labels'],
             color=self.get_color('primary')
         )
-        axes[2].set_xlim([0, freq_cut])
+        axes[2].set_xlim([0, freq_max])
         axes[2].set_ylim([amp_min, amp_max])
         axes[2].tick_params(
             axis='both',
@@ -608,7 +608,7 @@ class Plotter:
                                              phase_spectrum: np.ndarray = None,
                                              filtered_amp_spectrum: np.ndarray = None,
                                              lowpass_filter: np.ndarray = None,
-                                             freq_cut: float = None,
+                                             freq_max: float = None,
                                              outfile_path: Optional[str] = None) -> None:
         """
         Plots the filtered amplitude and phase spectrum.
@@ -619,7 +619,7 @@ class Plotter:
             raise ValueError("signal_freqs and amp_spectrum must have the same length.")
 
         max_idx = np.argmax(amp_spectrum)
-        max_freq = signal_freqs[max_idx]
+        max_freq = abs(signal_freqs[max_idx])
 
         fig, axes = plt.subplots(2, 1, figsize=self.settings['figure_size'])
 
@@ -632,6 +632,7 @@ class Plotter:
             color=self.get_color('observed'),
             linewidth=self.settings['line_width']
         )
+
         ax_amp.vlines(
             max_freq,
             ymin=np.amin(amp_spectrum),
@@ -656,14 +657,14 @@ class Plotter:
                 color=self.get_color('synthetic'),
                 linewidth=self.settings['line_width']
             )
-            if freq_cut is not None:
+            if freq_max is not None:
                 ax_amp.vlines(
-                    freq_cut,
+                    freq_max,
                     ymin=np.amin(filtered_amp_spectrum),
                     ymax=np.amax(filtered_amp_spectrum),
                     colors=self.get_color('highlight'),
                     linestyles='-',
-                    label=f"Cut-off = {freq_cut:.2f} MHz"
+                    label=f"Cut-off = {freq_max:.2f} MHz"
                 )
 
         ax_amp.set_title(
@@ -737,7 +738,7 @@ class Plotter:
                                        single_waveform: np.ndarray,
                                        single_waveform_filtered: np.ndarray,
                                        metadata: Dict,
-                                       freq_cut: float,
+                                       freq_max: float,
                                        outfile_path: Optional[str] = None) -> None:
         """
         Plot a comparison between a waveform and its filtered version.
@@ -769,7 +770,7 @@ class Plotter:
         )
 
         ax.set_title(
-            f"Effect of Lowpass Filtering at {freq_cut:.2f} MHz",
+            f"Effect of Lowpass Filtering at {freq_max:.2f} MHz",
             fontsize=self.settings['fontsize_title'],
             fontname=self.FONT_TYPE,
             color=self.get_color('primary')
@@ -1179,92 +1180,253 @@ class Plotter:
         plt.close(fig)
 
 
-    def plot_velocity_model(self,
-                            x: np.ndarray,
-                            c: np.ndarray,
-                            layer_starts: np.ndarray,
-                            pzt_layer_width: float,
-                            pla_layer_width: float,
-                            outfile_path: Optional[str] = None) -> None:
+    def plot_velocity_model(
+        self,
+        x: np.ndarray,
+        c: np.ndarray,
+        idx_dict: Dict[str, np.ndarray],
+        dx: float,
+        pzt_layer_width: float,
+        pla_layer_width: float,
+        outfile_path: Optional[str] = None,
+        quantity: str = "velocity",
+    ) -> None:
         """
-        Plot the velocity model with layers and smoothing.
+        Plot a velocity or Kelvin--Voigt damping profile and annotate the DDS
+        geometry using the actual grid indices.
         """
         if x.ndim != 1 or c.ndim != 1:
             raise ValueError("x and c must be 1D numpy arrays.")
         if len(x) != len(c):
             raise ValueError("x and c must have the same length.")
-        if layer_starts.ndim != 1:
-            raise ValueError("layer_starts must be a 1D numpy array.")
+        plot_labels = {
+            "velocity": {
+                "title": "Velocity model",
+                "ylabel": r"Velocity $c(x)$ [cm/$\mu$s]",
+                "curve": r"$c(x)$",
+            },
+            "damping": {
+                "title": "Kelvin–Voigt damping model",
+                "ylabel": r"Damping $\nu(x)$ [cm$^2$/$\mu$s]",
+                "curve": r"$\nu(x)$",
+            },
+        }
+        if quantity not in plot_labels:
+            raise ValueError("quantity must be either 'velocity' or 'damping'")
+        labels = plot_labels[quantity]
 
         fig, ax = plt.subplots(figsize=self.settings['figure_size'])
 
-        # Plot the velocity curve
         ax.plot(
             x,
             c,
-            label='Velocity Model',
+            label=labels["curve"],
             color=self.get_color('synthetic'),
-            linewidth= 2*self.settings['line_width']
+            linewidth=2 * self.settings['line_width'],
+            zorder=5,
         )
 
-        # Define layers with semantic roles
-        try:
-            layers = [
-                ('pla Layer 1', layer_starts[0], layer_starts[1], 'shadow'),
-                ('PZT Layer 1', layer_starts[1], layer_starts[2], 'synthetic'),
-                ('Side Block 1', layer_starts[2], layer_starts[3], 'misfit_light'),
-                ('Groove SB1', layer_starts[3], layer_starts[4], 'shadow'),
-                ('Gouge Layer 1', layer_starts[4], layer_starts[5], 'highlight'),
-                ('Groove CB1', layer_starts[5], layer_starts[6], 'shadow'),
-                ('Central Block', layer_starts[6], layer_starts[7], 'misfit_light'),
-                ('Groove CB2', layer_starts[7], layer_starts[8], 'shadow'),
-                ('Gouge Layer 2', layer_starts[8], layer_starts[9], 'highlight'),
-                ('Groove SB2', layer_starts[9], layer_starts[10], 'shadow'),
-                ('Side Block 2', layer_starts[10], layer_starts[11], 'misfit_light'),
-                ('PZT Layer 2', layer_starts[11], layer_starts[12], 'synthetic'),
-                ('pla Layer 2', layer_starts[12], layer_starts[13], 'shadow'),
-            ]
-        except IndexError:
-            layers = [
-                ('pla Layer 1', layer_starts[0], layer_starts[1], 'shadow'),
-                ('PZT Layer 1', layer_starts[1], layer_starts[2], 'synthetic'),
-                ('Steel Block', layer_starts[2], layer_starts[3], 'misfit_light'),
-                ('PZT Layer 2', layer_starts[3], layer_starts[4], 'synthetic'),
-                ('pla Layer 2', layer_starts[4], layer_starts[5], 'shadow'),
-            ]
+        layer_defs = [
+            ('pla_1', 'shadow'),
+            ('pzt_1', 'synthetic'),
+            ('side_block_1', 'misfit_light'),
+            ('groove_sb1', 'shadow'),
+            ('gouge_1', 'highlight'),
+            ('groove_cb1', 'shadow'),
+            ('central_block', 'misfit_light'),
+            ('groove_cb2', 'shadow'),
+            ('gouge_2', 'highlight'),
+            ('groove_sb2', 'shadow'),
+            ('side_block_2', 'misfit_light'),
+            ('pzt_2', 'synthetic'),
+            ('pla_2', 'shadow'),
+        ]
 
-        used = set()
-        for name, start, end, role in layers:
-            label = name if name not in used else None
-            used.add(name)
+        region_extents = {}
+        for key, role in layer_defs:
+            if key not in idx_dict or len(idx_dict[key]) == 0:
+                continue
+
+            idx = np.asarray(idx_dict[key], dtype=int)
+            start = x[idx[0]] - 0.5 * dx
+            end   = x[idx[-1]] + 0.5 * dx
+            region_extents[key] = (start, end)
+
             ax.axvspan(
-                start, end,
+                start,
+                end,
                 color=self.get_color(role),
                 alpha=0.3,
-                label=label
+                zorder=0,
             )
 
-        # Transmitter and receiver lines
+        axis_transform = ax.get_xaxis_transform()
+
+        # Wide regions can carry their own labels without occupying a legend.
+        block_labels = {
+            "side_block_1": "Side block 1",
+            "central_block": "Central block",
+            "side_block_2": "Side block 2",
+        }
+        for key, text in block_labels.items():
+            if key not in region_extents:
+                continue
+            start, end = region_extents[key]
+            ax.text(
+                0.5 * (start + end),
+                0.91,
+                text,
+                transform=axis_transform,
+                ha="center",
+                va="top",
+                fontsize=self.settings['fontsize_ticks'],
+                color=self.get_color('primary'),
+                bbox={
+                    "boxstyle": "round,pad=0.18",
+                    "facecolor": self.get_color('background'),
+                    "edgecolor": "none",
+                    "alpha": 0.72,
+                },
+                zorder=7,
+            )
+
+        domain_width = float(x[-1] - x[0])
+
+        def region_center(key: str) -> Optional[float]:
+            if key not in region_extents:
+                return None
+            start, end = region_extents[key]
+            return 0.5 * (start + end)
+
+        def annotate_region(
+            text: str,
+            key: str,
+            *,
+            text_x: float,
+            text_y: float,
+        ) -> None:
+            center = region_center(key)
+            if center is None:
+                return
+            ax.annotate(
+                text,
+                xy=(center, 0.13),
+                xycoords=axis_transform,
+                xytext=(text_x, text_y),
+                textcoords=axis_transform,
+                ha="center",
+                va="bottom",
+                fontsize=self.settings['fontsize_ticks'],
+                color=self.get_color('primary'),
+                arrowprops={
+                    "arrowstyle": "->",
+                    "color": self.get_color('primary'),
+                    "linewidth": 0.9,
+                    "shrinkA": 2,
+                    "shrinkB": 2,
+                },
+                zorder=8,
+            )
+
+        # Gouge layers and grooves are too thin for internal text.  Each gouge
+        # is identified separately.  The label shared by each groove pair is
+        # placed inside the central block, away from the gouge annotation, and
+        # points back to the two corresponding thin groove regions.
+        central_extent = region_extents.get("central_block")
+        for layer_number, gouge_key, groove_keys, direction in (
+            (1, "gouge_1", ("groove_sb1", "groove_cb1"), -1.0),
+            (2, "gouge_2", ("groove_cb2", "groove_sb2"), 1.0),
+        ):
+            gouge_center = region_center(gouge_key)
+            available_grooves = [
+                region_center(key) for key in groove_keys
+                if region_center(key) is not None
+            ]
+            if gouge_center is not None:
+                annotate_region(
+                    f"Gouge layer {layer_number}",
+                    gouge_key,
+                    text_x=gouge_center + direction * 0.055 * domain_width,
+                    text_y=0.68,
+                )
+            if available_grooves:
+                if central_extent is not None:
+                    central_start, central_end = central_extent
+                    central_width = central_end - central_start
+                    groove_text_x = (
+                        central_start + 0.18 * central_width
+                        if layer_number == 1
+                        else central_end - 0.18 * central_width
+                    )
+                else:
+                    groove_text_x = float(np.mean(available_grooves))
+                annotate_region(
+                    "Grooves",
+                    groove_keys[0],
+                    text_x=groove_text_x,
+                    text_y=0.48,
+                )
+                second_center = region_center(groove_keys[1])
+                if second_center is not None:
+                    ax.annotate(
+                        "",
+                        xy=(second_center, 0.13),
+                        xycoords=axis_transform,
+                        xytext=(groove_text_x, 0.48),
+                        textcoords=axis_transform,
+                        arrowprops={
+                            "arrowstyle": "->",
+                            "color": self.get_color('primary'),
+                            "linewidth": 0.9,
+                            "shrinkA": 2,
+                            "shrinkB": 2,
+                        },
+                        zorder=8,
+                    )
+
         transmitter_pos = pzt_layer_width + pla_layer_width
         receiver_pos = x[-1] - pzt_layer_width - pla_layer_width
-        ax.axvline(
-            transmitter_pos,
-            color=self.get_color('highlight'),
-            linestyle='-',
-            label='Transmitter'
-        )
-        ax.axvline(
-            receiver_pos,
-            color=self.get_color('accent'),
-            linestyle='-',
-            label='Receiver'
-        )
 
-        # Labels, title, grid, ticks
+        # Compact transducer markers replace the former full-height lines.
+        marker_width = max(4.0 * float(dx), 0.012 * domain_width)
+        transducer_markers = (
+            (transmitter_pos, "Source", self.get_color('highlight')),
+            (receiver_pos, "Receiver", self.get_color('accent')),
+        )
+        for position, text, color in transducer_markers:
+            center = float(np.clip(
+                position,
+                x[0] + 0.5 * marker_width,
+                x[-1] - 0.5 * marker_width,
+            ))
+            ax.add_patch(Rectangle(
+                (center - 0.5 * marker_width, 0.02),
+                marker_width,
+                0.075,
+                transform=axis_transform,
+                facecolor=color,
+                edgecolor=self.get_color('primary'),
+                linewidth=0.8,
+                clip_on=False,
+                zorder=9,
+            ))
+            ax.text(
+                center,
+                0.11,
+                text,
+                transform=axis_transform,
+                ha="center",
+                va="bottom",
+                fontsize=self.settings['fontsize_ticks'],
+                color=self.get_color('primary'),
+                zorder=9,
+            )
+
         ax.set_title(
-            "Velocity Model",
+            labels["title"],
             fontsize=self.settings['fontsize_title'],
-            color=self.get_color('primary')
+            color=self.get_color('primary'),
+            pad=34,
         )
         ax.set_xlabel(
             "Position (cm)",
@@ -1272,16 +1434,18 @@ class Plotter:
             color=self.get_color('primary')
         )
         ax.set_ylabel(
-            "Velocity (cm/$\\mu$s)",
+            labels["ylabel"],
             fontsize=self.settings['fontsize_labels'],
             color=self.get_color('primary')
         )
         ax.grid(alpha=0.2, color=self.get_color('shadow'))
         ax.legend(
-            loc='upper center',
+            loc='lower center',
+            bbox_to_anchor=(0.5, 1.005),
             fontsize=self.settings['fontsize_ticks'],
             facecolor=self.get_color('background'),
-            edgecolor=self.get_color('shadow')
+            edgecolor=self.get_color('shadow'),
+            framealpha=0.85,
         )
         ax.tick_params(
             axis='both',
@@ -1292,7 +1456,7 @@ class Plotter:
 
         fig.tight_layout()
         self.output_path_choice(fig=fig, outfile_path=outfile_path)
-
+        
     def plot_synthetic_spatial_function(self,
                                         x: np.ndarray,
                                         spatial_function: np.ndarray,
@@ -1521,22 +1685,23 @@ class Plotter:
         showing correlation in the title.
         """
         n_reflections = len(reflection_info_list)
-        fig, axs = plt.subplots(nrows=n_reflections,
-                                figsize=self.settings['figure_size'])
+        fig, axs = plt.subplots(
+            nrows=n_reflections,
+            figsize=self.settings['figure_size']
+        )
         if n_reflections == 1:
             axs = [axs]
 
         for ax, info in zip(axs, reflection_info_list):
             reflection_time = info['reflection_time']
             reflection_data = info['reflection_data']
-            arr_time        = info['arrival_time']
-            corr_coeff      = info['corr_coeff']
+            arr_time = info['arrival_time']
+            corr_coeff = info['corr_coeff']
 
             overlay_time = reflection_time - reflection_time[0]
             max_ref = np.max(reflection_data) if reflection_data.size else 1.0
             scale = np.max(direct_wave_data) / max_ref if max_ref != 0 else 1.0
 
-            # Direct waveform
             ax.plot(
                 overlay_time,
                 direct_wave_data,
@@ -1544,7 +1709,6 @@ class Plotter:
                 color=self.get_color('observed'),
                 linewidth=self.settings['line_width']
             )
-            # Scaled reflection
             ax.plot(
                 overlay_time,
                 scale * reflection_data,
@@ -1578,13 +1742,26 @@ class Plotter:
                 colors=self.get_color('shadow')
             )
             ax.grid(alpha=0.3, color=self.get_color('shadow'))
-            ax.legend(
-                fontsize=self.settings['fontsize_ticks'],
-                facecolor=self.get_color('background'),
-                edgecolor=self.get_color('shadow')
-            )
 
-        fig.tight_layout()
+        handles, labels = [], []
+        for ax in axs:
+            h, l = ax.get_legend_handles_labels()
+            handles.extend(h)
+            labels.extend(l)
+
+        by_label = dict(zip(labels, handles))
+
+        fig.legend(
+            by_label.values(),
+            by_label.keys(),
+            loc="upper center",
+            ncol=len(by_label),
+            fontsize=self.settings['fontsize_ticks'],
+            facecolor=self.get_color('background'),
+            edgecolor=self.get_color('shadow')
+        )
+
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
         self.output_path_choice(fig=fig, outfile_path=outfile_path)
 
     def plot_reflection_windows(
@@ -1655,7 +1832,7 @@ class Plotter:
         for i, info in enumerate(reflection_info_list, start=1):
             arr = info['arrival_time']
             start_idx = np.searchsorted(observed_time, arr)
-            end_idx   = start_idx + direct_span
+            end_idx = start_idx + direct_span
             if end_idx > len(observed_time):
                 break
             ax.axvspan(
@@ -1666,15 +1843,22 @@ class Plotter:
                 label="Reflection windows" if i == 1 else None
             )
 
-        # -- legend and finish --
-        ax.legend(
+        handles, labels = ax.get_legend_handles_labels()
+        by_label = dict(zip(labels, handles))
+
+        fig.legend(
+            by_label.values(),
+            by_label.keys(),
+            loc="upper center",
+            ncol=len(by_label),
             fontsize=self.settings['fontsize_ticks'],
             facecolor=self.get_color('background'),
             edgecolor=self.get_color('shadow')
         )
-        fig.tight_layout()
-        self.output_path_choice(fig=fig, outfile_path=outfile_path)
 
+        fig.tight_layout(rect=[0, 0, 1, 0.92])
+        self.output_path_choice(fig=fig, outfile_path=outfile_path)
+        
     def plot_original_vs_updated_stf(self,
                                  t: np.ndarray,
                                  stf_updated: np.ndarray,
@@ -1930,7 +2114,7 @@ class Plotter:
 
             min_l2 = np.nanmin(l2_values)
             max_l2 = np.nanmax(l2_values)
-            max_ylim = max_l2 if max_l2 < 3*min_l2 else 3*min_l2
+            max_ylim = max_l2 if max_l2 < 1.5*min_l2 else 1.5*min_l2
             ax.set_ylim([min_l2, max_ylim])
 
         # hide unused subplots

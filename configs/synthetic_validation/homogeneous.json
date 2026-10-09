@@ -1,0 +1,31 @@
+{
+  "extends": "base.json",
+  "name": "homogeneous",
+  "description": "All DDS regions have the same velocity and density; the correct model contains no impedance reverberation.",
+  "truth_model": {
+    "gouge_velocity_cm_us": [0.57, 0.57],
+    "gouge_damping_cm2_us": [0.0, 0.0],
+    "gouge_density_g_cm3": [7.8, 7.8]
+  },
+  "initial_model": {
+    "gouge_velocity_cm_us": [0.5, 0.5],
+    "gouge_damping_cm2_us": [0.0, 0.0],
+    "gouge_density_g_cm3": [6.5, 6.5]
+  },
+  "inversion": {
+    "coarse_axes": {
+      "gouge_velocity_common": [0.5, 0.57, 0.64],
+      "gouge_damping_common": [0.0],
+      "gouge_density_common": [6.5, 7.8, 9.1]
+    },
+    "bounds": {
+      "gouge_velocity_common": [0.4, 0.7],
+      "gouge_damping_common": [0.0, 0.001],
+      "gouge_density_common": [4.0, 11.0]
+    },
+    "local": {
+      "damping_step_cm2_us": 0.0,
+      "damping_threshold_cm2_us": 0.0
+    }
+  }
+}

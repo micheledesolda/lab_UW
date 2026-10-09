@@ -1,0 +1,24 @@
+{
+  "extends": "base.json",
+  "name": "joint_kinematic",
+  "description": "Joint unequal velocity and thickness test for the two gouge layers.",
+  "truth_model": {
+    "gouge_velocity_cm_us": [0.18, 0.22],
+    "gouge_thickness_cm": [0.04, 0.06]
+  },
+  "inversion": {
+    "coarse_axes": {
+      "gouge_velocity_1": [0.17, 0.18, 0.19],
+      "gouge_velocity_2": [0.21, 0.22, 0.23],
+      "gouge_thickness_1": [0.035, 0.04, 0.045],
+      "gouge_thickness_2": [0.055, 0.06, 0.065]
+    },
+    "fine_points_per_axis": 3,
+    "bounds": {
+      "gouge_velocity_1": [0.14, 0.23],
+      "gouge_velocity_2": [0.18, 0.27],
+      "gouge_thickness_1": [0.02, 0.07],
+      "gouge_thickness_2": [0.03, 0.08]
+    }
+  }
+}

@@ -7,13 +7,14 @@ license = "MIT"
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = ">=3.10" # accepts 3.10 .x and 3.11 .x
+python = ">=3.11" # accepts 3.10 .x and 3.11 .x
 numpy = "^2.1.3"
 scipy = "^1.14.1"
 pandas = "^2.2.3"
 matplotlib = "^3.9.2"
 h5py = "^3.15.1"
 numba = "^0.62.1"
+scikit-learn = "^1.8.0"
 
 
 [tool.poetry.group.dev.dependencies]
@@ -34,4 +35,5 @@ testpaths = ["tests"]
 
 [tool.poetry.scripts]
 build-docs = "sphinx.cmd.build:main"
+validate-reference = "lab_uw.validation.reference.cli:main"
 

@@ -1,9 +1,9 @@
 import numpy as np
 import pytest
-from lab_uw.data_io import DataHandler
+from lab_uw.data_io.data_io import UltrasonicDataHandler
 
 def test_load_waveform_json(tmp_path):
-    data_handler = DataHandler()
+    data_handler = UltrasonicDataHandler()
 
     # Sample data to write to JSON
     sample_data = np.array([1, 2, 3, 4])
@@ -20,7 +20,7 @@ def test_load_waveform_json(tmp_path):
     assert loaded_metadata == sample_metadata
 
 def test_serialize_value():
-    data_handler = DataHandler()
+    data_handler = UltrasonicDataHandler()
     assert data_handler.serialize_value(np.array([1, 2, 3])) == [1, 2, 3]
     assert data_handler.serialize_value(np.int32(10)) == 10
     assert data_handler.serialize_value(np.float64(3.14)) == 3.14

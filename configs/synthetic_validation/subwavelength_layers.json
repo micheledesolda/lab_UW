@@ -1,0 +1,35 @@
+{
+  "extends": "base.json",
+  "name": "subwavelength_layers",
+  "description": "Two 0.15 mm low-impedance gouge layers, well below the dominant wavelength, used to distinguish data recovery from parameter uniqueness.",
+  "truth_model": {
+    "gouge_velocity_cm_us": [0.2, 0.2],
+    "gouge_density_g_cm3": [2.4, 2.4],
+    "gouge_thickness_cm": [0.015, 0.015]
+  },
+  "initial_model": {
+    "gouge_thickness_cm": [0.03, 0.03]
+  },
+  "inversion": {
+    "coarse_axes": {
+      "gouge_velocity_common": [0.16, 0.2, 0.24],
+      "gouge_density_common": [1.8, 2.4, 3.0],
+      "gouge_thickness_common": [0.01, 0.015, 0.02]
+    },
+    "bounds": {
+      "gouge_velocity_common": [0.12, 0.3],
+      "gouge_density_common": [1.2, 4.0],
+      "gouge_thickness_common": [0.005, 0.04]
+    },
+    "equivalent_relative_tolerance": 0.05,
+    "local": {
+      "enabled": false
+    }
+  },
+  "acceptance": {
+    "max_waveform_relative_l2": 0.05,
+    "max_travel_time_error_us": 0.08,
+    "max_active_parameter_relative_error": 0.2,
+    "require_active_parameter_recovery": false
+  }
+}

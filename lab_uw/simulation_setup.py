@@ -3,9 +3,7 @@ import numpy as np
 import sys
 from pathlib import Path
 from abc import ABC, abstractmethod
-from typing import Tuple, Optional, Union, Dict
-
-from lab_uw.plotting import Plotter
+from typing import Tuple, Optional, Union, Dict, Literal
 
 class Grid1D:
     def __init__(self, cmin: float, fmax: float, grid_len: float, ppt: int):
@@ -18,10 +16,15 @@ class Grid1D:
             grid_len (float): Length of the grid.
             ppt (int): Points per the shortest wavelength.
         '''
-        self.cmin = cmin
-        self.fmax = fmax
-        self.grid_len = grid_len
-        self.ppt = ppt
+        if cmin <= 0 or fmax <= 0 or grid_len <= 0:
+            raise ValueError("cmin, fmax and grid_len must be positive")
+        if int(ppt) < 2:
+            raise ValueError("ppt must be at least 2")
+
+        self.cmin = float(cmin)
+        self.fmax = float(fmax)
+        self.grid_len = float(grid_len)
+        self.ppt = int(ppt)
         self.spatial_axis = self.make_grid()
         self.dx = self.spatial_axis[1] - self.spatial_axis[0]
         self.total_grid_points = len(self.spatial_axis)
@@ -33,12 +36,14 @@ class Grid1D:
         Returns:
             np.ndarray: 1D grid.
         '''
-        lambda_min = self.cmin / self.fmax       # [cm] minimum wavelength of the simulation
-        dx = lambda_min / self.ppt               # dx spacing x-axis
-        x = np.arange(0, self.grid_len + dx, dx)      # [cm] space coordinates
-        # if len(x) % 2:
-        #     x = np.append(x, self.grid_len + dx)
-        return x
+        lambda_min = self.cmin / self.fmax
+        target_dx = lambda_min / self.ppt
+
+        # Use an integer number of intervals so that the last node is exactly
+        # the physical end of the assembly.  The realised dx is never larger
+        # than the requested points-per-wavelength spacing.
+        n_intervals = max(2, int(np.ceil(self.grid_len / target_dx)))
+        return np.linspace(0.0, self.grid_len, n_intervals + 1)
 
     def plot(self):
         '''
@@ -71,26 +76,37 @@ class SimulationTime:
         '''
         Prepare the time variables for the simulation based on the spatial grid and maximum velocity.
         '''
-        # Extract the data sampling rate from observed_time
-        dt_obs = self.observed_time[1] - self.observed_time[0]
+        observed_time = np.asarray(self.observed_time, dtype=float).reshape(-1)
+        if observed_time.size < 2:
+            raise ValueError("observed_time must contain at least two samples")
+        if np.any(np.diff(observed_time) <= 0):
+            raise ValueError("observed_time must be strictly increasing")
+
+        # Extract the data sampling interval from observed_time.
+        dt_obs = observed_time[1] - observed_time[0]
 
         # Calculate the raw time step based on CFL condition
         if self.max_alpha:
-            # add cretirion for Kelvin–Voigt damping
-            from lab_uw.utils import solve_quadratic_equation
+            # Kelvin--Voigt stability condition.  Solve the positive root of
+            # A*dt^2 + B*dt + C = 0 directly; no project utility dependency is
+            # needed at this low numerical layer.
             A = self.max_velocity**2
-            B = self.max_alpha
+            # Von Neumann condition for the explicit Kelvin--Voigt stencil:
+            # c^2 dt^2 / dx^2 + 2 nu dt / dx^2 <= CFL^2.
+            B = 2.0 * self.max_alpha
             C = -(self.dx * self.cfl_factor) ** 2
-            solutions = solve_quadratic_equation(A, B, C, real_only=True, positive_only=True)
-            dt_raw = solutions[0]
+            discriminant = B * B - 4.0 * A * C
+            dt_raw = (-B + np.sqrt(discriminant)) / (2.0 * A)
         else:
             dt_raw = (self.cfl_factor * self.dx) / self.max_velocity
 
         # Find the largest submultiple of dt_obs smaller than dt_raw
         self.dt = dt_obs / np.ceil(dt_obs / dt_raw)
 
-        # Create the time axis for the simulation
-        self.simulation_time = np.arange(0, self.observed_time[-1], self.dt)
+        # Include the last observed sample so interpolation never extrapolates
+        # the final datum as a constant value.
+        tmax = float(observed_time[-1] - observed_time[0])
+        self.simulation_time = np.arange(0.0, tmax + 0.5 * self.dt, self.dt)
 
         self.num_t = len(self.simulation_time)
 
@@ -141,36 +157,26 @@ class VelocityModel1DBase(ABC):
         sample_dimensions: Tuple[float, ...],
         pzt_layer_width: float,
         pla_layer_width: float,
-        block_velocity: dict,
         pzt_velocity: float,
         pla_velocity: float,
-        outfile_path: Optional[Path] = None
+        outfile_path: Optional[Path] = None,
     ):
         self.x = x
         self.sample_dimensions = sample_dimensions
 
-        self.pzt_layer_width = pzt_layer_width
-        self.pla_layer_width = pla_layer_width
+        self.pzt_layer_width = float(pzt_layer_width)
+        self.pla_layer_width = float(pla_layer_width)
 
-        if isinstance(block_velocity, dict):
-            self.block_velocity_side1 = float(block_velocity["side1"])
-            self.block_velocity_central = float(block_velocity["central"])
-            self.block_velocity_side2 = float(block_velocity["side2"])
-        else:
-            # backward compatible
-            self.block_velocity_side1 = float(block_velocity)
-            self.block_velocity_central = float(block_velocity)
-            self.block_velocity_side2 = float(block_velocity)
-
-        self.pzt_velocity   = pzt_velocity
-        self.pla_velocity   = pla_velocity
+        self.pzt_velocity = float(pzt_velocity)
+        self.pla_velocity = float(pla_velocity)
 
         self.outfile_path = outfile_path
 
-        # Data structures populated by the builder methods:
-        self.layer_starts: np.ndarray = None
+        self.layer_starts: Optional[np.ndarray] = None
         self.idx_dict: Dict[str, np.ndarray] = {}
-        self.velocity_array: np.ndarray = None
+        self.velocity_array: Optional[np.ndarray] = None
+        self.damping_array: Optional[np.ndarray] = None
+        self.density_array: Optional[np.ndarray] = None
 
     @abstractmethod
     def build_velocity_model(self):
@@ -205,19 +211,27 @@ class VelocityModel1DBase(ABC):
             self.velocity_array[indices] = velocity
 
 
-    def plot(self, model, outfile_path: Optional[str] = None):
+    def plot(
+        self,
+        model,
+        outfile_path: Optional[str] = None,
+        quantity: str = "velocity",
+    ):
         if outfile_path is None:
             outfile_path = self.outfile_path
+
+        from lab_uw.plotting import Plotter
 
         Plotter().plot_velocity_model(
             x=self.x,
             c=model,
-            layer_starts=self.layer_starts,
+            idx_dict=self.idx_dict,
+            dx=self.x[1]-self.x[0],
             pzt_layer_width=self.pzt_layer_width,
             pla_layer_width=self.pla_layer_width,
-            outfile_path=outfile_path
+            outfile_path=outfile_path,
+            quantity=quantity,
         )
-
 class VelocityModel1D_SingleBlock(VelocityModel1DBase):
     """
     Single-block 1D velocity model:
@@ -237,23 +251,32 @@ class VelocityModel1D_SingleBlock(VelocityModel1DBase):
         pzt_velocity: float,
         pla_velocity: float,
         plotting: bool = False,
-        outfile_path: Optional[Path] = None
+        outfile_path: Optional[Path] = None,
+        block_density: float = 1.0,
+        pzt_density: float = 1.0,
+        pla_density: float = 1.0,
     ):
+        
         super().__init__(
             x=x,
             sample_dimensions=sample_dimensions,
             pzt_layer_width=pzt_layer_width,
             pla_layer_width=pla_layer_width,
-            block_velocity=block_velocity,
             pzt_velocity=pzt_velocity,
             pla_velocity=pla_velocity,
-            outfile_path=outfile_path
+            outfile_path=outfile_path,
         )
+        
+        self.block_velocity = float(block_velocity)
+        self.block_density = float(block_density)
+        self.pzt_density = float(pzt_density)
+        self.pla_density = float(pla_density)
         self.x_transmitter = x_transmitter
         self.x_receiver    = x_receiver
         self.plotting      = plotting
         self.velocity_array: np.ndarray = None
         self.damping_array: np.ndarray = None
+        self.density_array: np.ndarray = None
 
         # Build the model
         self.build_velocity_model()
@@ -272,6 +295,8 @@ class VelocityModel1D_SingleBlock(VelocityModel1DBase):
             self.velocity_array[-1] = self.velocity_array[-2]
 
         self.initialize_damping_array()
+        self.initialize_density_array()
+        self.assign_densities()
 
     def compute_layer_positions(self):
         """
@@ -310,10 +335,27 @@ class VelocityModel1D_SingleBlock(VelocityModel1DBase):
     def initialize_damping_array(self):
         self.damping_array = np.zeros_like(self.x)
 
+    def initialize_density_array(self):
+        self.density_array = self.block_density * np.ones_like(self.x)
+
+    def assign_densities(self):
+        density_map = {
+            "pla_1": self.pla_density,
+            "pzt_1": self.pzt_density,
+            "block": self.block_density,
+            "pzt_2": self.pzt_density,
+            "pla_2": self.pla_density,
+        }
+        for region, density in density_map.items():
+            indices = self.idx_dict.get(region, np.array([], dtype=int))
+            self.density_array[indices] = density
+        if len(self.x) > 1:
+            self.density_array[-1] = self.density_array[-2]
+
     def assign_velocities(self):
         self.assign_constant_velocity("pla_1",       self.pla_velocity)
         self.assign_constant_velocity("pzt_1",       self.pzt_velocity)
-        self.assign_constant_velocity("block", self.block_velocity)
+        self.assign_constant_velocity("block",       self.block_velocity)
         self.assign_constant_velocity("pzt_2",       self.pzt_velocity)
         self.assign_constant_velocity("pla_2",       self.pla_velocity)
 
@@ -367,7 +409,7 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
     A 1D velocity model for a double-direct-shear (DDS) test sample 
     that includes grooves, gouge layers, side blocks, central block, etc.
 
-    Layer layout (from left to right):
+    Legacy layer layout (from left to right):
         1.  pla_1
         2.  pzt_1
         3.  side_block_1
@@ -404,27 +446,55 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         pzt_velocity: float,
         pla_velocity: float,
         outfile_path: Optional[Path] = None,
-        plotting: bool = False
+        plotting: bool = False,
+        include_transducer_layers: bool = True,
+        block_density: Union[float, Dict[str, float]] = 1.0,
+        gouge_density: Tuple[float, float] = (1.0, 1.0),
+        pzt_density: float = 1.0,
+        pla_density: float = 1.0,
     ):
-        # Store main attributes
-        self.x = x
-        self.sample_dimensions = sample_dimensions
-        self.x_transmitter    = x_transmitter
-        self.x_receiver       = x_receiver
-        self.pzt_layer_width  = pzt_layer_width
-        self.pla_layer_width  = pla_layer_width
-        self.h_groove_side    = h_groove_side
-        self.h_groove_central = h_groove_central
+        super().__init__(
+            x=x,
+            sample_dimensions=sample_dimensions,
+            pzt_layer_width=pzt_layer_width,
+            pla_layer_width=pla_layer_width,
+            pzt_velocity=pzt_velocity,
+            pla_velocity=pla_velocity,
+            outfile_path=outfile_path,
+        )
 
         if isinstance(block_velocity, dict):
             self.block_velocity_side1 = float(block_velocity["side1"])
             self.block_velocity_central = float(block_velocity["central"])
             self.block_velocity_side2 = float(block_velocity["side2"])
+            self.h_groove_side    = h_groove_side
+            self.h_groove_central = h_groove_central
         else:
-            # backward compatible
             self.block_velocity_side1 = float(block_velocity)
             self.block_velocity_central = float(block_velocity)
             self.block_velocity_side2 = float(block_velocity)
+
+        if isinstance(block_density, dict):
+            self.block_density_side1 = float(block_density["side1"])
+            self.block_density_central = float(block_density["central"])
+            self.block_density_side2 = float(block_density["side2"])
+        else:
+            self.block_density_side1 = float(block_density)
+            self.block_density_central = float(block_density)
+            self.block_density_side2 = float(block_density)
+        self.gouge_density = tuple(float(value) for value in gouge_density)
+        self.pzt_density = float(pzt_density)
+        self.pla_density = float(pla_density)
+        density_values = (
+            self.block_density_side1,
+            self.block_density_central,
+            self.block_density_side2,
+            *self.gouge_density,
+            self.pzt_density,
+            self.pla_density,
+        )
+        if any((not np.isfinite(value)) or value <= 0 for value in density_values):
+            raise ValueError("all material densities must be finite and positive")
 
         self.gouge_velocity = gouge_velocity  # (gouge_1, gouge_2)
         self.gouge_damping  = gouge_damping  
@@ -433,6 +503,7 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
 
         self.outfile_path = outfile_path
         self.plotting     = plotting
+        self.include_transducer_layers = bool(include_transducer_layers)
 
         # Internals
         self.layer_thicknesses = []
@@ -440,6 +511,7 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         self.idx_dict = {}
         self.velocity_array: np.ndarray = None
         self.damping_array: np.ndarray = None
+        self.density_array: np.ndarray = None
 
         self.build_velocity_model()
 
@@ -458,6 +530,11 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
 
         self.initialize_damping_array()
         self.assign_damping()
+        self.initialize_density_array()
+        self.assign_densities()
+
+        if len(self.x) > 1:
+            self.density_array[-1] = self.density_array[-2]
 
     def compute_layer_positions(self):
         """
@@ -475,22 +552,32 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         side_block_2  = side_block_2_total - self.h_groove_side
         central_block = central_block_total - 2.0 * self.h_groove_central
 
-        # Build the list of layer thicknesses in order
-        self.layer_thicknesses = [
-            self.pla_layer_width,
-            self.pzt_layer_width,
-            side_block_1,
-            self.h_groove_side,
-            gouge_1_length,
-            self.h_groove_central,
-            central_block,
-            self.h_groove_central,
-            gouge_2_length,
-            self.h_groove_side,
-            side_block_2,
-            self.pzt_layer_width,
-            self.pla_layer_width
+        mechanical_names = [
+            "side_block_1", "groove_sb1", "gouge_1", "groove_cb1",
+            "central_block", "groove_cb2", "gouge_2", "groove_sb2",
+            "side_block_2",
         ]
+        mechanical_thicknesses = [
+            side_block_1, self.h_groove_side, gouge_1_length,
+            self.h_groove_central, central_block, self.h_groove_central,
+            gouge_2_length, self.h_groove_side, side_block_2,
+        ]
+
+        if self.include_transducer_layers:
+            self.layer_names = ["pla_1", "pzt_1", *mechanical_names, "pzt_2", "pla_2"]
+            self.layer_thicknesses = [
+                self.pla_layer_width,
+                self.pzt_layer_width,
+                *mechanical_thicknesses,
+                self.pzt_layer_width,
+                self.pla_layer_width,
+            ]
+        else:
+            # The effective STF already contains both transducers and their
+            # couplings.  The numerical domain therefore starts and ends at
+            # the external steel faces.
+            self.layer_names = mechanical_names
+            self.layer_thicknesses = mechanical_thicknesses
 
         # Now get cumulative starts
         self.layer_starts = np.concatenate(([0.0], np.cumsum(self.layer_thicknesses)))
@@ -501,25 +588,34 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         The region names must match the order used in compute_layer_positions().
         """
         x = self.x
-        region_names = [
-            "pla_1", "pzt_1", "side_block_1", "groove_sb1", "gouge_1",
-            "groove_cb1", "central_block", "groove_cb2", "gouge_2",
-            "groove_sb2", "side_block_2", "pzt_2", "pla_2"
-        ]
+        region_names = self.layer_names
         self.idx_dict.clear()
 
         for i, region in enumerate(region_names):
             start = self.layer_starts[i]
             end   = self.layer_starts[i + 1]
-            indices = np.where((x >= start) & (x <= end))[0]
+            if self.include_transducer_layers:
+                # Preserve the historical interface ownership exactly.
+                indices = np.where((x >= start) & (x <= end))[0]
+            elif i == len(region_names) - 1:
+                indices = np.where((x >= start) & (x <= end))[0]
+            else:
+                # Effective-surface regions are disjoint.  This is required
+                # for unambiguous gradients and thickness updates.
+                indices = np.where((x >= start) & (x < end))[0]
             self.idx_dict[region] = indices
+
+        # Keep a stable public schema for plotting and legacy callers.
+        for region in ("pla_1", "pzt_1", "pzt_2", "pla_2"):
+            self.idx_dict.setdefault(region, np.array([], dtype=int))
 
     def initialize_velocity_array(self):
         self.velocity_array = self.block_velocity_side1 * np.ones_like(self.x)
 
     def assign_velocities(self):
-        self.assign_constant_velocity('pla_1', self.pla_velocity)
-        self.assign_constant_velocity('pzt_1', self.pzt_velocity)
+        if self.include_transducer_layers:
+            self.assign_constant_velocity('pla_1', self.pla_velocity)
+            self.assign_constant_velocity('pzt_1', self.pzt_velocity)
 
         # Explicit block assignments 
         self.assign_constant_velocity('side_block_1', self.block_velocity_side1)
@@ -527,23 +623,24 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         self.assign_constant_velocity('side_block_2', self.block_velocity_side2)
 
         # Grooves: ramp between the *correct* adjacent block and gouge
-        # self.assign_groove_velocity('groove_sb1', self.gouge_velocity[0], is_start=True,  block_velocity=self.block_velocity_side1)
-        self.assign_constant_velocity('groove_sb1', self.block_velocity_side1)
+        self.assign_groove_velocity('groove_sb1', self.gouge_velocity[0], is_start=True,  block_velocity=self.block_velocity_side1)
+        # self.assign_constant_velocity('groove_sb1', self.block_velocity_side1)
 
-        # self.assign_groove_velocity('groove_cb1', self.gouge_velocity[0], is_start=False, block_velocity=self.block_velocity_central)
-        self.assign_constant_velocity('groove_cb1', self.block_velocity_central)
+        self.assign_groove_velocity('groove_cb1', self.gouge_velocity[0], is_start=False, block_velocity=self.block_velocity_central)
+        # self.assign_constant_velocity('groove_cb1', self.block_velocity_central)
 
-        # self.assign_groove_velocity('groove_cb2', self.gouge_velocity[1], is_start=True,  block_velocity=self.block_velocity_central)
-        self.assign_constant_velocity('groove_cb2', self.block_velocity_central)
+        self.assign_groove_velocity('groove_cb2', self.gouge_velocity[1], is_start=True,  block_velocity=self.block_velocity_central)
+        # self.assign_constant_velocity('groove_cb2', self.block_velocity_central)
 
-        # self.assign_groove_velocity('groove_sb2', self.gouge_velocity[1], is_start=False, block_velocity=self.block_velocity_side2)
-        self.assign_constant_velocity('groove_sb2', self.block_velocity_side2)
+        self.assign_groove_velocity('groove_sb2', self.gouge_velocity[1], is_start=False, block_velocity=self.block_velocity_side2)
+        # self.assign_constant_velocity('groove_sb2', self.block_velocity_side2)
 
         self.assign_gouge_velocity('gouge_1', self.gouge_velocity[0])
         self.assign_gouge_velocity('gouge_2', self.gouge_velocity[1])
 
-        self.assign_constant_velocity('pzt_2', self.pzt_velocity)
-        self.assign_constant_velocity('pla_2', self.pla_velocity)
+        if self.include_transducer_layers:
+            self.assign_constant_velocity('pzt_2', self.pzt_velocity)
+            self.assign_constant_velocity('pla_2', self.pla_velocity)
 
 
     def initialize_damping_array(self):
@@ -552,26 +649,60 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         '''
         self.damping_array = np.zeros_like(self.x)
 
+    def initialize_density_array(self):
+        self.density_array = self.block_density_side1 * np.ones_like(self.x)
+
+    def assign_densities(self):
+        if self.include_transducer_layers:
+            self.assign_constant_density("pla_1", self.pla_density)
+            self.assign_constant_density("pzt_1", self.pzt_density)
+
+        self.assign_constant_density("side_block_1", self.block_density_side1)
+        self.assign_constant_density("central_block", self.block_density_central)
+        self.assign_constant_density("side_block_2", self.block_density_side2)
+        self.assign_groove_density(
+            "groove_sb1", self.gouge_density[0], is_start=True,
+            block_density=self.block_density_side1,
+        )
+        self.assign_constant_density("gouge_1", self.gouge_density[0])
+        self.assign_groove_density(
+            "groove_cb1", self.gouge_density[0], is_start=False,
+            block_density=self.block_density_central,
+        )
+        self.assign_groove_density(
+            "groove_cb2", self.gouge_density[1], is_start=True,
+            block_density=self.block_density_central,
+        )
+        self.assign_constant_density("gouge_2", self.gouge_density[1])
+        self.assign_groove_density(
+            "groove_sb2", self.gouge_density[1], is_start=False,
+            block_density=self.block_density_side2,
+        )
+
+        if self.include_transducer_layers:
+            self.assign_constant_density("pzt_2", self.pzt_density)
+            self.assign_constant_density("pla_2", self.pla_density)
+
     def assign_damping(self):
         '''
         Assign damping to the guge region and the ramp to the grooves ones.
         '''
 
-        # self.assign_groove_damping('groove_sb1', self.gouge_damping[0], is_start=True)
-        self.assign_gouge_damping('groove_sb1', self.gouge_damping[0])
+        self.assign_groove_damping('groove_sb1', self.gouge_damping[0], is_start=True)
+        # self.assign_gouge_damping('groove_sb1', self.gouge_damping[0])
 
         self.assign_gouge_damping('gouge_1', self.gouge_damping[0])
 
-        # self.assign_groove_damping('groove_cb1', self.gouge_damping[0], is_start=False)
-        self.assign_gouge_damping('groove_cb1', self.gouge_damping[0])
+        self.assign_groove_damping('groove_cb1', self.gouge_damping[0], is_start=False)
+        # self.assign_gouge_damping('groove_cb1', self.gouge_damping[0])
 
         self.assign_gouge_damping('gouge_2', self.gouge_damping[1])
 
-        # self.assign_groove_damping('groove_cb2', self.gouge_damping[1], is_start=True)
-        self.assign_gouge_damping('groove_cb2', self.gouge_damping[1])
+        self.assign_groove_damping('groove_cb2', self.gouge_damping[1], is_start=True)
+        # self.assign_gouge_damping('groove_cb2', self.gouge_damping[1])
 
-        # self.assign_groove_damping('groove_sb2', self.gouge_damping[1], is_start=False)
-        self.assign_gouge_damping('groove_sb2', self.gouge_damping[1])
+        self.assign_groove_damping('groove_sb2', self.gouge_damping[1], is_start=False)
+        # self.assign_gouge_damping('groove_sb2', self.gouge_damping[1])
 
     def assign_constant_velocity(self, region_name: str, velocity: float):
         '''
@@ -580,8 +711,24 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         indices = self.idx_dict.get(region_name, [])
         self.velocity_array[indices] = velocity
 
-    import numpy as np
-    from typing import Union
+    def assign_constant_density(self, region_name: str, density: float):
+        indices = self.idx_dict.get(region_name, np.array([], dtype=int))
+        self.density_array[indices] = float(density)
+
+    def assign_groove_density(
+        self,
+        region_name: str,
+        adjacent_density: float,
+        is_start: bool,
+        block_density: float,
+    ):
+        """Linearly mix density through the finite-width groove ramp."""
+        indices = self.idx_dict.get(region_name, np.array([], dtype=int))
+        if not indices.size:
+            return
+        start = float(block_density) if is_start else float(adjacent_density)
+        end = float(adjacent_density) if is_start else float(block_density)
+        self.density_array[indices] = np.linspace(start, end, indices.size)
 
     def assign_gouge_velocity(self, region_name: str, gouge_velocity: Union[float, np.ndarray]):
         '''
@@ -688,40 +835,6 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         self.damping_array[indices] = (1.0 - f) * start_damp + f * end_damp
 
 
-    # def assign_groove_velocity(self, region_name: str, adjacent_velocity: Union[float, np.ndarray], is_start: bool):
-    #     '''
-    #     Assign velocities in groove regions with linear gradients.
-    #     '''
-    #     indices = self.idx_dict.get(region_name, [])
-    #     if not indices.size:
-    #         return
-    #     groove_length = len(indices)
-    #     if groove_length == 1:
-    #         self.velocity_array[indices] = adjacent_velocity[0] if isinstance(adjacent_velocity, np.ndarray) else adjacent_velocity
-    #         return
-
-    #     start_vel = self.block_velocity if is_start else (adjacent_velocity[-1] if isinstance(adjacent_velocity, np.ndarray) else adjacent_velocity)
-    #     end_vel = (adjacent_velocity[0] if isinstance(adjacent_velocity, np.ndarray) else adjacent_velocity) if is_start else self.block_velocity
-
-    #     self.velocity_array[indices] = np.linspace(start_vel, end_vel, groove_length)
-
-    # def assign_groove_damping(self, region_name: str, adjacent_damping: Union[float, np.ndarray], is_start: bool):
-    #     '''
-    #     Assign velocities in groove regions with linear gradients.
-    #     '''
-    #     indices = self.idx_dict.get(region_name, [])
-    #     if not indices.size:
-    #         return
-    #     groove_length = len(indices)
-    #     if groove_length == 1:
-    #         self.damping_array[indices] = adjacent_damping[0] if isinstance(adjacent_damping, np.ndarray) else adjacent_damping
-    #         return
-
-    #     start_damp = 0 if is_start else (adjacent_damping[-1] if isinstance(adjacent_damping, np.ndarray) else adjacent_damping)
-    #     end_damp = (adjacent_damping[0] if isinstance(adjacent_damping, np.ndarray) else adjacent_damping) if is_start else 0
-
-    #     self.damping_array[indices] = np.linspace(start_damp, end_damp, groove_length)
-
     def apply_smoothing_between(self, region_from: str, region_to: str, n_smooth: int):
         """
         Smooth the boundary transition from `region_from` to `region_to`.
@@ -785,6 +898,10 @@ class VelocityModel1D_DDS(VelocityModel1DBase):
         # 7) Write the ramp into self.velocity_array
         self.velocity_array[boundary_indices] = ramp
 
+SpatialNormalization = Literal["legacy_peak", "sum", "l1", "l2", "integral"]
+SpatialBoundaryMode = Literal["legacy_odd", "truncate"]
+
+
 class Source1D:
     def __init__(self, stf_time: np.ndarray, 
                  stf_waveform: np.ndarray,
@@ -792,6 +909,8 @@ class Source1D:
                  pzt_layer_width: float,
                  radius: int, 
                  extension: float = None,
+                 normalization: SpatialNormalization = "legacy_peak",
+                 boundary_mode: SpatialBoundaryMode = "legacy_odd",
 
 ):
         '''
@@ -809,6 +928,8 @@ class Source1D:
         self.radius = radius
         self.extension = extension
         self.pzt_layer_width = pzt_layer_width
+        self.normalization = normalization
+        self.boundary_mode = boundary_mode
         self.time_function = None  # Will be set after interpolation
         self.spatial_function = None  # Will be set after being created on the grid
 
@@ -820,10 +941,26 @@ class Source1D:
             dt (float): Time step size of the simulation.
             simulation_time (np.ndarray): Simulation time array.
         '''
-        interpolated_stf_time = np.arange(self.stf_time[0], self.stf_time[-1], dt)
-        interpolated_stf = np.interp(interpolated_stf_time, self.stf_time, self.stf_waveform)
-        self.time_function = np.zeros(len(simulation_time))
-        self.time_function[:len(interpolated_stf)] = interpolated_stf
+        stf_time = np.asarray(self.stf_time, dtype=float).reshape(-1)
+        stf_waveform = np.asarray(self.stf_waveform, dtype=float).reshape(-1)
+        simulation_time = np.asarray(simulation_time, dtype=float).reshape(-1)
+
+        if stf_time.size != stf_waveform.size:
+            raise ValueError("STF time and waveform must have the same length")
+        if stf_time.size < 2 or np.any(np.diff(stf_time) <= 0):
+            raise ValueError("STF time axis must be strictly increasing")
+
+        # The HDF5 wavelet keeps the absolute experimental arrival time for
+        # provenance.  Numerically it is an effective source and must start at
+        # simulation time zero.
+        relative_stf_time = stf_time - stf_time[0]
+        self.time_function = np.interp(
+            simulation_time,
+            relative_stf_time,
+            stf_waveform,
+            left=0.0,
+            right=0.0,
+        )
 
     def create_spatial_function(self, spatial_axis: np.ndarray, dx: float):
 
@@ -834,6 +971,8 @@ class Source1D:
             pzt_layer_width=self.pzt_layer_width,
             extension=self.extension,
             radius=self.radius,
+            normalization=self.normalization,
+            boundary_mode=self.boundary_mode,
         )
 
     def plot_spatial_function(self, x: np.ndarray, spatial_function: np.ndarray, outfile_path: Optional[str] = None):
@@ -845,6 +984,8 @@ class Source1D:
             spatial_function (np.ndarray): Spatial function values.
             outfile_path (str, optional): Path to save the plot.
         '''
+        from lab_uw.plotting import Plotter
+
         Plotter().plot_synthetic_spatial_function(
             x=x,
             spatial_function=spatial_function,
@@ -857,6 +998,8 @@ class Receiver1D:
                  pzt_layer_width: float,
                  radius: int, 
                  extension: float = None,
+                 normalization: SpatialNormalization = "legacy_peak",
+                 boundary_mode: SpatialBoundaryMode = "legacy_odd",
                 ):        
         '''
         Initialize the 1D receiver.
@@ -869,6 +1012,8 @@ class Receiver1D:
         self.radius = radius
         self.extension = extension
         self.pzt_layer_width = pzt_layer_width
+        self.normalization = normalization
+        self.boundary_mode = boundary_mode
         self.spatial_function = None  # Will be set after being created on the grid
 
     def create_spatial_function(self, spatial_axis: np.ndarray, dx: float):
@@ -880,6 +1025,8 @@ class Receiver1D:
             pzt_layer_width=self.pzt_layer_width,
             extension=self.extension,
             radius=self.radius,
+            normalization=self.normalization,
+            boundary_mode=self.boundary_mode,
         )
 
 def arbitrary_source_and_receiver_positioning(
@@ -891,7 +1038,9 @@ def arbitrary_source_and_receiver_positioning(
     beta                : float = 6.31,
     radius              : int = None,
     free_surface_left   : float = None,
-    free_surface_right  : float = None    
+    free_surface_right  : float = None,
+    normalization      : SpatialNormalization = "legacy_peak",
+    boundary_mode      : SpatialBoundaryMode = "legacy_odd",
 ) -> np.ndarray:
     """
     Implementation in python of the method reported in Hicks 2002:
@@ -909,8 +1058,10 @@ def arbitrary_source_and_receiver_positioning(
 
     if radius is None:
         radius = int(round(pzt_layer_width / (2*dx)))
+    radius = max(1, int(radius))
     if extension is None:
         extension = pzt_layer_width/2
+    extension = max(0.0, float(extension))
 
     window_len = 2*radius+1
     filter_window = kaiser(window_len,beta)
@@ -923,11 +1074,40 @@ def arbitrary_source_and_receiver_positioning(
     else:
         raise ValueError("Position ouside the spatial axis simulated")
 
-    pzt_positions = np.arange(pzt_start, pzt_end, dx)   
+    if extension <= dx or pzt_end <= pzt_start:
+        pzt_positions = np.array([position], dtype=float)
+    else:
+        pzt_positions = np.arange(pzt_start, pzt_end + 0.5 * dx, dx)
+    if boundary_mode not in {"legacy_odd", "truncate"}:
+        raise ValueError(f"Unknown boundary_mode: {boundary_mode!r}")
+
     finite_spatial_function = np.zeros(spatial_axis.shape)
     for delta_position in pzt_positions:
+        if boundary_mode == "truncate":
+            # A clipped Hicks kernel is appropriate for an effective operator
+            # located on a free boundary.  The historical odd folding below
+            # enforces a zero at that boundary and therefore annihilates an
+            # exactly nodal source/receiver at x=0 or x=L.
+            center_idx = int(np.rint((delta_position - spatial_axis[0]) / dx))
+            full_start = center_idx - radius
+            full_end = center_idx + radius + 1
+            clipped_start = max(free_surface_left_idx, full_start)
+            clipped_end = min(free_surface_right_idx + 1, full_end)
+            if clipped_end <= clipped_start:
+                continue
+            local_start = clipped_start - full_start
+            local_end = local_start + (clipped_end - clipped_start)
+            local_x = spatial_axis[clipped_start:clipped_end]
+            finite_spatial_function[clipped_start:clipped_end] += (
+                np.sinc((local_x - delta_position) / dx)
+                * filter_window[local_start:local_end]
+            )
+            continue
+
         filter.fill(0.0)                     # start with a clean window each time
-        raw_delta_approx = sinc(spatial_axis-delta_position)
+        # np.sinc expects a dimensionless argument.  Hicks' interpolator is
+        # expressed in grid-coordinate offsets, not in centimetres.
+        raw_delta_approx = sinc((spatial_axis-delta_position) / dx)
         delta_position_idx = np.searchsorted(spatial_axis, delta_position)
         start_idx = delta_position_idx - radius
         end_idx   = delta_position_idx - radius + window_len
@@ -965,10 +1145,30 @@ def arbitrary_source_and_receiver_positioning(
 
         optimal_delta_approx = raw_delta_approx*filter  
         finite_spatial_function += optimal_delta_approx 
-    max_val = np.amax(finite_spatial_function)
-    if max_val == 0:                         # nothing was written – probably a set‑up error
+    max_abs = np.max(np.abs(finite_spatial_function))
+    if max_abs == 0:                         # nothing was written – probably a set‑up error
+        print(f"radius= {radius}, extension= {extension}")
         raise ValueError("Spatial function is identically zero; check radius/extension.")
-    finite_spatial_function /= max_val
+
+    if normalization == "legacy_peak":
+        finite_spatial_function /= max_abs
+    elif normalization == "sum":
+        denom = np.sum(finite_spatial_function)
+        if abs(denom) < 1e-15:
+            raise ValueError("Cannot sum-normalize a zero-sum spatial function")
+        finite_spatial_function /= denom
+    elif normalization == "l1":
+        finite_spatial_function /= np.sum(np.abs(finite_spatial_function))
+    elif normalization == "l2":
+        finite_spatial_function /= np.linalg.norm(finite_spatial_function)
+    elif normalization == "integral":
+        denom = np.sum(finite_spatial_function) * dx
+        if abs(denom) < 1e-15:
+            raise ValueError("Cannot integral-normalize a zero-integral spatial function")
+        finite_spatial_function /= denom
+    else:
+        raise ValueError(f"Unknown spatial normalization: {normalization!r}")
+
     return finite_spatial_function
 
 ##################################

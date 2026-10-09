@@ -1,0 +1,21 @@
+{
+  "extends": "base.json",
+  "name": "asymmetric_thickness",
+  "description": "Known redistribution of a fixed total gouge thickness between the two layers.",
+  "truth_model": {
+    "gouge_thickness_cm": [0.04, 0.06]
+  },
+  "inversion": {
+    "coarse_axes": {
+      "gouge_thickness_1": [0.035, 0.04, 0.045],
+      "gouge_thickness_2": [0.055, 0.06, 0.065]
+    },
+    "bounds": {
+      "gouge_thickness_1": [0.02, 0.07],
+      "gouge_thickness_2": [0.03, 0.08]
+    },
+    "local": {
+      "enabled": false
+    }
+  }
+}

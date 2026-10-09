@@ -1,7 +1,7 @@
 # lab_uw/data_io/schema.py
 from dataclasses import dataclass, field
 import numpy as np
-from typing import Dict, Any
+from typing import Dict, Any, Iterator, Mapping
 
 @dataclass
 class UWFrame:
@@ -30,3 +30,31 @@ class UWFrame:
             self.waveform_data = x[None, :]
             self.metadata["number_of_waveforms"] = 1
         return self
+
+
+@dataclass
+class MultiChannelUWFrame:
+    """Frames recorded in the same multichannel acquisition.
+
+    Each channel remains a separate 2D frame "because interrupted recordings
+    can leave channels with different numbers of waveforms." <- chatgpt extrapolation from my fix. 
+    That is not precisely the main problem for mistrass tsv files, although could be for 
+    hdf5 tiepie ones
+    """
+
+    channels: Mapping[str, UWFrame]
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.channels = dict(self.channels)
+        if not self.channels:
+            raise ValueError("A multichannel frame must contain at least one channel.")
+
+    def __getitem__(self, channel_name: str) -> UWFrame:
+        return self.channels[channel_name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.channels)
+
+    def __len__(self) -> int:
+        return len(self.channels)

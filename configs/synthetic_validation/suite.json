@@ -1,0 +1,10 @@
+{
+  "configs": [
+    "homogeneous.json",
+    "impedance_contrast.json",
+    "asymmetric_velocity.json",
+    "asymmetric_thickness.json",
+    "joint_kinematic.json",
+    "subwavelength_layers.json"
+  ]
+}
