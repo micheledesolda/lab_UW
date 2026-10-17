@@ -11,6 +11,8 @@ import numpy as np
 from typing import Optional, Dict, List, Union, Tuple
 import pickle
 import os
+import gc
+import mmap
 
 class Plotter:
     """
@@ -18,12 +20,14 @@ class Plotter:
     """
 
     # Define default settings for plots
-    FONT_TYPE = "Dejavu Sans"
-    FONT_SIZE = 30
-    FIGURE_SIZE = (16, 8)
+    FONT_TYPE = "DejaVu Sans"
+    FONT_SIZE = 32
+    FIGURE_SIZE = (16, 9)
     FORMAT = ".png"
 
     PALETTE = {
+        'ink': '#202124',
+        'white': '#ffffff',
         # BLU shades
         'blu1': '#203a7a',
         'blu2': '#2d4e9e',
@@ -62,9 +66,9 @@ class Plotter:
     }
 
     SEMANTIC = {
-        'primary':      'gray1',     # 
-        'background':    'gray6',     # very light grey
-        'axes_face':     'gray6',
+        'primary':      'ink',     # 
+        'background':    'white',     # very light grey
+        'axes_face':     'white',
 
         'observed':      'blu2',      # darkest blue for data
         'synthetic':     'red2',      # bright red
@@ -79,10 +83,11 @@ class Plotter:
 
     DEFAULT_SETTINGS = {
         'fontsize_title': FONT_SIZE,
-        'fontsize_subplot_title': int(0.7 * FONT_SIZE),
-        'fontsize_labels': int(0.7 * FONT_SIZE),
-        'fontsize_ticks': int(0.5 * FONT_SIZE),
-        'line_width': 1.0,
+        'fontsize_subplot_title': 28,
+        'fontsize_labels': 28,
+        'fontsize_ticks': 22,
+        'fontsize_legend': 20,
+        'line_width': 1.8,
         'figure_size': FIGURE_SIZE,
         'format': FORMAT,
     }
@@ -130,677 +135,385 @@ class Plotter:
 
         if outfile_path:
             outfile_path = Path(outfile_path)
+            format = '.' + str(format).lstrip('.')
             if outfile_path.suffix != format:
-                outfile_path = outfile_path.with_suffix(format)
-            fig.savefig(outfile_path, dpi=300)
-            fig.clf()
-            plt.close()
+                known_formats = {'.png', '.pdf', '.svg', '.jpg', '.jpeg', '.tif', '.tiff', '.eps', '.webp'}
+                outfile_path = (outfile_path.with_suffix(format)
+                                if outfile_path.suffix.lower() in known_formats
+                                else Path(str(outfile_path) + format))
+            outfile_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                fig.savefig(outfile_path, dpi=self.settings.get('dpi', 300), bbox_inches='tight')
+                for extra_format in self.settings.get('additional_formats', ()):
+                    extra_suffix = '.' + str(extra_format).lstrip('.')
+                    if extra_suffix != outfile_path.suffix:
+                        extra_dpi = (self.settings.get('pdf_raster_dpi', self.settings.get('dpi', 300))
+                                     if extra_suffix == '.pdf' else self.settings.get('dpi', 300))
+                        fig.savefig(outfile_path.with_suffix(extra_suffix),
+                                    dpi=extra_dpi, bbox_inches='tight')
+            finally:
+                fig.clear()
+                plt.close(fig)
+                gc.collect()
         else:
             plt.show()
 
-    def uw_all_plot(self,
-                    data: np.ndarray,
-                    metadata: Dict,
-                    step_wf_to_plot: int,
-                    highlight_start: int,
-                    highlight_end: int,
-                    xlim_plot: float,
-                    ticks_steps_waveforms: float,
-                    outfile_path: Optional[str] = None) -> None:
+    def _style_data_axes(self, ax, title, xlabel, ylabel):
+        """Common readable style for experimental data figures."""
+        color = self.get_color('primary')
+        ax.set_title(title, fontsize=self.settings['fontsize_title'], pad=18, color=color)
+        ax.set_xlabel(xlabel, fontsize=self.settings['fontsize_labels'], labelpad=12, color=color)
+        ax.set_ylabel(ylabel, fontsize=self.settings['fontsize_labels'], labelpad=12, color=color)
+        ax.tick_params(axis='both', labelsize=self.settings['fontsize_ticks'], colors=color)
+        ax.locator_params(axis='x', nbins=5)
+        ax.xaxis.get_offset_text().set_fontsize(self.settings['fontsize_ticks'])
+        ax.yaxis.get_offset_text().set_fontsize(self.settings['fontsize_ticks'])
+        ax.grid(alpha=0.18)
+
+    def _style_data_colorbar(self, fig, image, ax, label):
+        colorbar = fig.colorbar(image, ax=ax, pad=0.025)
+        colorbar.set_label(label, fontsize=self.settings['fontsize_labels'], labelpad=14)
+        colorbar.ax.tick_params(labelsize=self.settings['fontsize_ticks'])
+        colorbar.ax.yaxis.get_offset_text().set_fontsize(self.settings['fontsize_ticks'])
+        return colorbar
+
+    @staticmethod
+    def _coordinate_edges(values):
+        values = np.asarray(values, dtype=float)
+        if values.ndim != 1 or not values.size or not np.isfinite(values).all():
+            raise ValueError('Map coordinates must be finite non-empty 1D arrays.')
+        if values.size == 1:
+            return np.array([values[0] - 0.5, values[0] + 0.5])
+        spacing = np.diff(values)
+        if np.any(spacing <= 0):
+            raise ValueError('Map coordinates must be strictly increasing.')
+        return np.r_[values[0] - spacing[0] / 2,
+                     values[:-1] + spacing / 2,
+                     values[-1] + spacing[-1] / 2]
+
+    @staticmethod
+    def _release_mapped_pages(array):
+        """Release read disk-cache pages on platforms supporting madvise."""
+        current = array
+        while current is not None:
+            if isinstance(current, np.memmap):
+                mapping = getattr(current, '_mmap', None)
+                if mapping is not None and hasattr(mapping, 'madvise') and hasattr(mmap, 'MADV_DONTNEED'):
+                    try:
+                        current.flush()
+                        mapping.madvise(mmap.MADV_DONTNEED)
+                    except (OSError, ValueError):
+                        pass
+                break
+            current = getattr(current, 'base', None)
+
+    def _bounded_map(self, values, x, y, *, signed):
+        """Pool every input cell into a bounded display grid, in small blocks.
+
+        Signed cells retain the value with largest absolute magnitude;
+        non-negative cells retain their maximum. This affects display only:
+        the processing pipeline computes every original adjacent difference.
+        Group boundaries retain the original, possibly nonuniform time edges.
         """
-        Example method for plotting stacked waveforms with optional highlighting.
+        values = np.asanyarray(values)
+        if values.shape != (len(x), len(y)):
+            raise ValueError('Map data must have shape (acquisitions, samples).')
+        nx = min(len(x), int(self.settings.get('map_max_columns', 1600)))
+        ny = min(len(y), int(self.settings.get('map_max_rows', 1024)))
+        if min(nx, ny) < 1:
+            raise ValueError('Map dimensions and display limits must be positive.')
+        row_edges = np.linspace(0, len(x), nx + 1, dtype=int)
+        col_edges = np.linspace(0, len(y), ny + 1, dtype=int)
+        display = np.empty((nx, ny), dtype=np.float32)
+        budget = float(self.settings.get('processing_memory_mb', 32)) * 1024 ** 2
+        block_rows = max(1, min(128, int(budget // max(1, len(y) * 32))))
+        for column in range(nx):
+            maximum = np.full(len(y), -np.inf)
+            minimum = np.full(len(y), np.inf) if signed else None
+            for start in range(row_edges[column], row_edges[column + 1], block_rows):
+                block = values[start:min(start + block_rows, row_edges[column + 1])]
+                if not np.isfinite(block).all():
+                    raise ValueError('Map data must be finite.')
+                np.maximum(maximum, np.max(block, axis=0), out=maximum)
+                if signed:
+                    np.minimum(minimum, np.min(block, axis=0), out=minimum)
+                elif np.any(block < 0):
+                    raise ValueError('Amplitude spectra must be non-negative.')
+            maximum = np.maximum.reduceat(maximum, col_edges[:-1])
+            if signed:
+                minimum = np.minimum.reduceat(minimum, col_edges[:-1])
+                display[column] = np.where(np.abs(minimum) > np.abs(maximum), minimum, maximum)
+            else:
+                display[column] = maximum
+            if column % 32 == 0:
+                self._release_mapped_pages(values)
+        self._release_mapped_pages(values)
+        xedges = self._coordinate_edges(x)[row_edges]
+        yedges = self._coordinate_edges(y)[col_edges]
+        return display, xedges, yedges
+
+    def _experimental_heatmap(self, values, x, y, *, title, ylabel,
+                              colorbar_label, outfile_path, signed=False,
+                              log_scale=False, cmap=None, color_limit=None):
+        gc.collect()
+        values, xedges, yedges = self._bounded_map(values, x, y, signed=signed)
+        fig, ax = plt.subplots(figsize=self.settings['figure_size'], layout='constrained')
+        peak = float(np.max(np.abs(values)))
+        if signed:
+            limit = peak if color_limit is None else float(color_limit)
+            if not np.isfinite(limit) or limit < 0:
+                raise ValueError('color_limit must be finite and non-negative.')
+            limit = limit or 1.0
+            norm = mcolors.Normalize(vmin=-limit, vmax=limit)
+            cmap = cmap or 'RdBu_r'
+        elif log_scale and peak > 0:
+            if np.any(values < 0):
+                raise ValueError('Logarithmic amplitude maps require non-negative data.')
+            # Global color scaling in original units: no normalization per trace.
+            decades = float(self.settings.get('spectrum_dynamic_range_decades', 4.0))
+            if not 0 < decades <= 300:
+                raise ValueError('spectrum_dynamic_range_decades must lie in (0, 300].')
+            floor = max(peak * 10.0 ** (-decades), np.finfo(float).tiny)
+            norm = mcolors.LogNorm(vmin=floor, vmax=max(peak, floor * 10))
+            np.maximum(values, floor, out=values)
+            cmap = cmap or 'magma'
+        else:
+            norm = mcolors.Normalize(vmin=0.0, vmax=peak or 1.0)
+            cmap = cmap or 'magma'
+        # imshow avoids the dense per-cell vertices and RGBA arrays of QuadMesh.
+        # Nonuniform coordinates use QuadMesh only AFTER the bounded pooling.
+        uniform = np.allclose(np.diff(xedges), np.diff(xedges)[0]) and np.allclose(np.diff(yedges), np.diff(yedges)[0])
+        if uniform:
+            image = ax.imshow(values.T, aspect='auto', origin='lower', interpolation='nearest',
+                              extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]], cmap=cmap, norm=norm)
+        else:
+            image = ax.pcolormesh(xedges, yedges, values.T, shading='flat', cmap=cmap,
+                                  norm=norm, rasterized=True)
+        self._style_data_axes(ax, title, 'Experiment time [s]', ylabel)
+        ax.grid(False)
+        if len(y) > 1:
+            ax.set_ylim(float(y[0]), float(y[-1]))
+        self._style_data_colorbar(fig, image, ax, colorbar_label)
+        self.output_path_choice(fig=fig, outfile_path=outfile_path)
+
+    def uw_all_plot(self, data, metadata, step_wf_to_plot, highlight_start,
+                    highlight_end, xlim_plot, ticks_steps_waveforms,
+                    outfile_path=None, *, max_waveforms=20,
+                    title='Direct arrivals'):
+        """Overlay a limited number of unnormalized traces, colored by shot time."""
+        data = np.asarray(data)
+        if data.ndim != 2 or not data.size:
+            raise ValueError('data must be a non-empty 2D array.')
+        if step_wf_to_plot < 1 or max_waveforms < 1:
+            raise ValueError('Trace step and max_waveforms must be positive.')
+        time = np.asarray(metadata['time_ax_waveform'])
+        indices = np.arange(0, data.shape[0], int(step_wf_to_plot))
+        if indices.size > max_waveforms:
+            indices = indices[np.linspace(0, indices.size - 1, max_waveforms, dtype=int)]
+        if indices[-1] != data.shape[0] - 1 and indices.size < max_waveforms:
+            indices = np.r_[indices, data.shape[0] - 1]
+        acquisition = np.asarray(metadata.get('time_ax_acquisition', np.arange(data.shape[0])))
+        if acquisition.shape != (data.shape[0],):
+            raise ValueError('Acquisition times must match the waveform rows.')
+        low, high = float(acquisition.min()), float(acquisition.max())
+        norm = mcolors.Normalize(low, high if high > low else low + 1)
+        cmap = plt.get_cmap(self.settings.get('cmap_time', 'viridis'))
+        fig, ax = plt.subplots(figsize=self.settings['figure_size'], layout='constrained')
+        for index in indices:
+            ax.plot(time, data[index], color=cmap(norm(acquisition[index])),
+                    linewidth=self.settings['line_width'], alpha=0.85)
+        if not 0 <= highlight_start <= highlight_end <= data.shape[0]:
+            raise ValueError('Highlight indices are outside the waveform rows.')
+        for index in range(highlight_start, highlight_end):
+            ax.plot(time, data[index], color=self.get_color('synthetic'), linewidth=2.0)
+        units = metadata.get('amplitude_unit', 'a.u.')
+        self._style_data_axes(ax, title, r'Time after trigger [$\mu$s]', f'Amplitude [{units}]')
+        ax.set_xlim(time[0], min(xlim_plot, time[-1]) if xlim_plot else time[-1])
+        if ticks_steps_waveforms and ticks_steps_waveforms > 0:
+            ticks = np.arange(time[0], time[-1] + 1e-10, ticks_steps_waveforms)
+            if 2 <= ticks.size <= 8:
+                ax.set_xticks(ticks)
+        self._style_data_colorbar(fig, plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax,
+                                 'Experiment time [s]')
+        self.output_path_choice(fig=fig, outfile_path=outfile_path)
+
+    def amplitude_map(self, data, metadata, outfile_path=None, *,
+                      difference=False, title=None, color_limit=None):
+        """Map direct-arrival samples, or signed next-minus-current differences."""
+        units = metadata.get('amplitude_unit', 'a.u.')
+        label = f'Amplitude difference [{units}]' if difference else f'Amplitude [{units}]'
+        self._experimental_heatmap(
+            data, metadata['time_ax_acquisition'], metadata['time_ax_waveform'],
+            title=title or ('Consecutive waveform differences' if difference else 'Direct-arrival amplitude'),
+            ylabel=r'Time after trigger [$\mu$s]', colorbar_label=label,
+            outfile_path=outfile_path, signed=True, color_limit=color_limit,
+            cmap=self.settings.get('cmap', 'RdBu_r'))
+
+    def amplitude_spectrum_map(self, signal_freqs, amp_spectrum, metadata,
+                               freq_max, outfile_path=None, *, difference=False,
+                               title=None, log_scale=True, color_limit=None):
+        """Map one-sided spectra; signed differences use a zero-centered scale.
+
+        The caller computes spectra from the selected direct-arrival window.
+        Frequencies are already one-sided and must not be halved a second time.
         """
-        if data.ndim != 2:
-            raise ValueError("data must be a 2D numpy array.")
-        if 'time_ax_waveform' not in metadata:
-            raise KeyError("metadata must contain 'time_ax_waveform'.")
+        frequency = np.asarray(signal_freqs)
+        amplitudes = np.asanyarray(amp_spectrum)
+        if amplitudes.ndim != 2 or amplitudes.shape[1] != frequency.size:
+            raise ValueError('Spectra must have shape (acquisitions, frequencies).')
+        stop = int(np.searchsorted(frequency, frequency[-1] if freq_max is None else freq_max, side='right'))
+        if stop == 0:
+            raise ValueError('No frequencies in the requested plotting range.')
+        units = metadata.get('amplitude_unit', 'a.u.')
+        label = f'Spectral difference [{units}]' if difference else f'Spectral amplitude [{units}]'
+        self._experimental_heatmap(
+            amplitudes[:, :stop], metadata['time_ax_acquisition'], frequency[:stop],
+            title=title or ('Consecutive spectral amplitude differences' if difference else 'Direct-arrival spectrum'),
+            ylabel='Frequency [MHz]', colorbar_label=label,
+            outfile_path=outfile_path, signed=difference, log_scale=log_scale,
+            color_limit=color_limit,
+            cmap=self.settings.get('cmap_difference', 'RdBu_r') if difference else self.settings.get('cmap_spectrum', 'magma'))
 
-        time_ax_waveform = metadata["time_ax_waveform"]
-        if highlight_start < 0 or highlight_end > data.shape[0]:
-            raise ValueError("highlight_start and highlight_end must be within the range of data indices.")
+    def amplitude_spectrum_distribution(self, signal_freqs, amp_spectrum,
+                                        metadata, freq_max, outfile_path=None):
+        """Accumulate an exact spectral histogram in bounded row blocks."""
+        gc.collect()
+        frequency = np.asarray(signal_freqs)
+        amplitudes = np.asanyarray(amp_spectrum)
+        if amplitudes.ndim != 2 or amplitudes.shape[1] != frequency.size:
+            raise ValueError('Spectra must have shape (acquisitions, frequencies).')
+        stop = int(np.searchsorted(frequency, frequency[-1] if freq_max is None else freq_max, side='right'))
+        frequency, amplitudes = frequency[:stop], amplitudes[:, :stop]
+        if frequency.size < 2 or not amplitudes.shape[0]:
+            raise ValueError('Require at least two frequencies and one spectrum.')
+        budget = float(self.settings.get('processing_memory_mb', 32)) * 1024 ** 2
+        rows = max(1, min(128, int(budget // max(1, frequency.size * 128))))
+        maximum = 0.0
+        for start in range(0, amplitudes.shape[0], rows):
+            block = amplitudes[start:start + rows]
+            if not np.isfinite(block).all() or np.any(block < 0):
+                raise ValueError('Require finite non-negative spectra.')
+            maximum = max(maximum, float(block.max()))
+            self._release_mapped_pages(amplitudes)
+        maximum = maximum or 1.0
+        f_edges = np.linspace(frequency[0], frequency[-1], min(200, frequency.size) + 1)
+        a_edges = np.linspace(0, maximum * 1.001, 161)
+        histogram = np.zeros((len(f_edges) - 1, len(a_edges) - 1))
+        for start in range(0, amplitudes.shape[0], rows):
+            block = amplitudes[start:start + rows]
+            # Only this small block has an expanded frequency vector.
+            counts, _, _ = np.histogram2d(
+                np.broadcast_to(frequency, block.shape).ravel(), block.ravel(),
+                bins=[f_edges, a_edges])
+            histogram += counts
+            self._release_mapped_pages(amplitudes)
 
-        time_ticks_waveforms = np.arange(time_ax_waveform[0],
-                                         time_ax_waveform[-1],
-                                         ticks_steps_waveforms)
-        data_to_plot = data[::step_wf_to_plot]
-        ymax = 1.3 * np.amax(data_to_plot)
-        ymin = 1.3 * np.amin(data_to_plot)
-
-        fig, ax = plt.subplots(figsize=self.settings['figure_size'])
-
-        # Plot all waveforms in the 'observed' role
-        ax.plot(
-            time_ax_waveform,
-            data_to_plot.T,
-            color=self.get_color('observed'),
-            linewidth=0.8,
-            alpha=0.5
-        )
-        # Highlight the selected subset in the 'highlight' role
-        ax.plot(
-            time_ax_waveform,
-            data[highlight_start:highlight_end].T,
-            color=self.get_color('highlight'),
-            linewidth=self.settings['line_width']
-        )
-
-        ax.set_xlabel('Time [$\\mu s$]', fontsize=self.settings['fontsize_labels'])
-        ax.set_ylabel('Amplitude [a.u.]', fontsize=self.settings['fontsize_labels'])
-        ax.set_xticks(time_ticks_waveforms)
-        ax.set_ylim([ymin, ymax])
-        ax.set_xlim(time_ax_waveform[0], xlim_plot)
-        ax.grid(alpha=0.1, color=self.get_color('shadow'))
-
-        ax.set_title("Stacked Waveforms",
-                     fontsize=self.settings['fontsize_title'],
-                     fontname=self.FONT_TYPE)
-        ax.tick_params(axis='both',
-                       which='major',
-                       labelsize=self.settings['fontsize_ticks'])
-
-        fig.tight_layout()
+        width, height = self.settings['figure_size']
+        fig, axes = plt.subplots(3, 1, figsize=(width, max(14, 1.6 * height)), layout='constrained')
+        indices = np.unique(np.linspace(0, amplitudes.shape[0] - 1,
+                                         min(12, amplitudes.shape[0]), dtype=int))
+        for index, color in zip(indices, plt.get_cmap('viridis')(np.linspace(0, 1, len(indices)))):
+            axes[0].plot(frequency, np.array(amplitudes[index], copy=True), color=color,
+                         linewidth=self.settings['line_width'])
+        self._release_mapped_pages(amplitudes)
+        axes[0].set_ylim(bottom=0)
+        units = metadata.get('amplitude_unit', 'a.u.')
+        ylabel = f'Spectral amplitude [{units}]'
+        self._style_data_axes(axes[0], 'Selected direct-arrival spectra', 'Frequency [MHz]', ylabel)
+        for ax, logarithmic in zip(axes[1:], (True, False)):
+            norm = mcolors.LogNorm(1, max(2, histogram.max())) if logarithmic else None
+            image = ax.pcolormesh(f_edges, a_edges, np.ma.masked_equal(histogram.T, 0) if logarithmic else histogram.T,
+                                  shading='flat', cmap='magma', norm=norm, rasterized=True)
+            self._style_data_axes(ax, 'Spectral amplitude distribution', 'Frequency [MHz]', ylabel)
+            self._style_data_colorbar(fig, image, ax, 'Count [log scale]' if logarithmic else 'Count')
+        for ax in axes:
+            ax.set_xlim(frequency[0], frequency[-1])
         self.output_path_choice(fig=fig, outfile_path=outfile_path)
 
 
-    def amplitude_map(self,
-                      data: np.ndarray,
-                      metadata: Dict,
-                      outfile_path: Optional[str] = None) -> None:
+    def filtered_amp_and_phase_spectrum_plot(
+        self, signal_freqs, amp_spectrum, phase_spectrum=None,
+        filtered_amp_spectrum=None, lowpass_filter=None, freq_max=None,
+        outfile_path=None, *, show_phase=False, show_filter=False,
+        amplitude_ylim=None, amplitude_unit='a.u.', title='Direct-arrival amplitude spectrum',
+    ):
+        """Plot unnormalized spectral amplitudes on a linear y axis.
+
+        Phase is opt-in. An optional filter gain is drawn on its own
+        dimensionless axis, without rescaling the data spectra. Supply |H|^2
+        for the forward/backward Butterworth filter used by bandpass().
         """
-        Plots an amplitude map of waveform data.
-
-        Args:
-            data (np.ndarray): 2D array representing waveform data (n_waveforms, n_samples).
-            metadata (Dict): Metadata dictionary containing necessary keys.
-            outfile_path (str, optional): Path to save the plot.
-
-        Raises:
-            KeyError: If required keys are missing in metadata.
-        """
-        required_keys = ['time_ax_waveform', 'sampling_rate', 'number_of_samples', 'acquisition_frequency']
-        for key in required_keys:
-            if key not in metadata:
-                raise KeyError(f"Missing '{key}' in metadata.")
-
-        time_ax_waveform   = metadata['time_ax_waveform']
-        first_sample_time  = time_ax_waveform[0]
-        last_sample_time   = time_ax_waveform[-1]
-        time_ax_acquisition = metadata['time_ax_acquisition']
-        first_waveform_time = time_ax_acquisition[0]
-        last_waveform_time  = time_ax_acquisition[-1]
-
-        fig, ax = plt.subplots(figsize=self.settings['figure_size'])
-
-        # allow overriding the heatmap colormap via settings, default to 'seismic'
-        cmap_name = self.settings.get('cmap', 'seismic')
-        cmap = plt.get_cmap(cmap_name)
-
-        extent = [
-            first_waveform_time, last_waveform_time,
-            first_sample_time,    last_sample_time
-        ]
-        amp_scale_limit = max(-np.amin(data), np.amax(data))
-
-        im = ax.imshow(
-            data.T,
-            aspect='auto',
-            origin='lower',
-            interpolation='none',
-            cmap=cmap,
-            vmin=-amp_scale_limit,
-            vmax=amp_scale_limit,
-            extent=extent
-        )
-
-        # colorbar styling
-        cbar = fig.colorbar(im, pad=0.04)
-        cbar.set_label(
-            "Relative Amplitude",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        cbar.ax.yaxis.set_tick_params(
-            labelsize=self.settings['fontsize_ticks'],
-            colors=self.get_color('shadow')
-        )
-        plt.setp(cbar.ax.get_yticklabels(), color=self.get_color('shadow'))
-
-        # axis titles & labels in primary color
-        ax.set_title(
-            "Amplitude Map",
-            fontsize=self.settings['fontsize_title'],
-            fontname=self.FONT_TYPE,
-            color=self.get_color('primary')
-        )
-        ax.set_xlabel(
-            'Experiment Time [s]',
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        ax.set_ylabel(
-            'Waveform Travel Time [$\\mu s$]',
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-
-        # tick styling
-        ax.tick_params(
-            axis='both',
-            which='major',
-            labelsize=self.settings['fontsize_ticks'],
-            colors=self.get_color('shadow')
-        )
-
-        fig.tight_layout()
+        frequency, amplitude = np.asarray(signal_freqs), np.asarray(amp_spectrum)
+        if frequency.ndim != 1 or amplitude.shape != frequency.shape:
+            raise ValueError('Frequencies and amplitudes must be matching 1D arrays.')
+        if not np.isfinite(amplitude).all() or np.any(amplitude < 0):
+            raise ValueError('Spectral amplitudes must be finite and non-negative.')
+        show_phase = bool(show_phase and phase_spectrum is not None)
+        fig, axes = plt.subplots(2 if show_phase else 1, 1,
+                                 figsize=self.settings['figure_size'], squeeze=False,
+                                 layout='constrained')
+        ax = axes[0, 0]
+        ax.plot(frequency, amplitude, color=self.get_color('observed'),
+                label='Unfiltered', linewidth=self.settings['line_width'])
+        if filtered_amp_spectrum is not None:
+            filtered = np.asarray(filtered_amp_spectrum)
+            if filtered.shape != frequency.shape:
+                raise ValueError('Filtered spectrum must match the frequency axis.')
+            ax.plot(frequency, filtered, color=self.get_color('synthetic'),
+                    label='Filtered', linewidth=self.settings['line_width'])
+        self._style_data_axes(ax, title, 'Frequency [MHz]', f'Spectral amplitude [{amplitude_unit}]')
+        ax.set_xlim(0, min(freq_max, frequency[-1]) if freq_max is not None else frequency[-1])
+        ax.set_ylim(amplitude_ylim if amplitude_ylim is not None else (0, None))
+        lines, labels = ax.get_legend_handles_labels()
+        if show_filter and lowpass_filter is not None:
+            gain = np.asarray(lowpass_filter)
+            if gain.shape != frequency.shape:
+                raise ValueError('Filter response must match the frequency axis.')
+            gain_ax = ax.twinx()
+            gain_ax.plot(frequency, gain, color=self.get_color('accent'), linestyle='--',
+                         linewidth=2, label='Filter response')
+            gain_ax.set_ylim(0, 1.05)
+            gain_ax.set_ylabel('Filter gain [1]', fontsize=self.settings['fontsize_labels'], labelpad=12)
+            gain_ax.tick_params(labelsize=self.settings['fontsize_ticks'])
+            extra_lines, extra_labels = gain_ax.get_legend_handles_labels()
+            lines += extra_lines
+            labels += extra_labels
+        ax.legend(lines, labels, fontsize=self.settings.get('fontsize_legend', 20), loc='upper right')
+        if show_phase:
+            phase_ax = axes[1, 0]
+            phase_ax.plot(frequency, phase_spectrum, color=self.get_color('accent'))
+            phase_ax.set_xlim(ax.get_xlim())
+            phase_ax.set_ylim(-np.pi, np.pi)
+            phase_ax.set_yticks([-np.pi, 0, np.pi], [r'$-\pi$', '0', r'$\pi$'])
+            self._style_data_axes(phase_ax, 'Phase spectrum', 'Frequency [MHz]', 'Phase [rad]')
         self.output_path_choice(fig=fig, outfile_path=outfile_path)
 
-
-    def amplitude_spectrum_map(
-        self,
-        signal_freqs: np.ndarray,
-        amp_spectrum: np.ndarray,
-        metadata: Dict,
-        freq_max: float,
-        outfile_path: Optional[str] = None
-    ) -> None:
-        """
-        Plots an amplitude spectrum map of waveform data.
-
-        Parameters
-        ----------
-        signal_freqs : np.ndarray
-            Frequencies of the signal (size n_samples).
-        amp_spectrum : np.ndarray
-            Amplitude spectrum of shape (n_waveforms, n_samples).
-        metadata : dict
-            Metadata dictionary containing 'time_ax_acquisition'.
-        freq_max : float
-            Maximum frequency to display on the y-axis (in MHz).
-        outfile_path : str, optional
-            Path to save the plot.
-        
-        Raises
-        ------
-        KeyError
-            If 'time_ax_acquisition' is missing in metadata.
-        ValueError
-            If dimensions of amp_spectrum and signal_freqs do not match or if amp_spectrum is not 2D.
-        """
-        if 'time_ax_acquisition' not in metadata:
-            raise KeyError("metadata must contain 'time_ax_acquisition'.")
-
-        if amp_spectrum.ndim != 2:
-            raise ValueError("amp_spectrum must be a 2D numpy array.")
-
-        time_ax_acquisition = metadata['time_ax_acquisition']
-        wave_num, wave_len = amp_spectrum.shape
-
-        # Only plot half of the spectrum if it's symmetrical
-        spectrum_length = wave_len // 2
-        freqs = signal_freqs[:spectrum_length]
-        amps  = amp_spectrum[:, :spectrum_length]
-
-        fig, ax = plt.subplots(figsize=self.settings['figure_size'])
-
-        # allow colormap override via settings
-        cmap_name = self.settings.get('cmap_spectrum', 'plasma')
-        cmap = plt.get_cmap(cmap_name)
-
-        pcm = ax.pcolormesh(
-            time_ax_acquisition,
-            freqs,
-            amps.T,
-            cmap=cmap,
-            norm=mcolors.LogNorm(vmin=1e-3, vmax=amps.max())
-        )
-        ax.set_ylim([0, freq_max])
-
-        # colorbar
-        cbar = fig.colorbar(pcm, pad=0.04)
-        cbar.set_label(
-            "Spectral Amplitude",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        cbar.ax.yaxis.set_tick_params(
-            labelsize=self.settings['fontsize_ticks'],
-            colors=self.get_color('shadow')
-        )
-        plt.setp(cbar.ax.get_yticklabels(), color=self.get_color('shadow'))
-
-        # titles and labels
-        ax.set_title(
-            'Amplitude Spectrum Map',
-            fontsize=self.settings['fontsize_title'],
-            fontname=self.FONT_TYPE,
-            color=self.get_color('primary')
-        )
-        ax.set_xlabel(
-            "Time [s]",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        ax.set_ylabel(
-            "Frequency [MHz]",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-
-        # ticks and grid
-        ax.tick_params(
-            axis='both',
-            which='major',
-            labelsize=self.settings['fontsize_ticks'],
-            colors=self.get_color('shadow')
-        )
-        ax.grid(alpha=0.1, color=self.get_color('shadow'))
-
-        fig.tight_layout()
+    def signal_vs_filtered_signal_plot(
+        self, single_waveform, single_waveform_filtered, metadata,
+        freq_max=None, outfile_path=None, *, title='Direct-arrival waveform',
+        highlight_window=None, amplitude_ylim=None,
+    ):
+        """Compare traces with absolute sample times and optional direct window."""
+        time = np.asarray(metadata['time_ax_waveform'])
+        original, filtered = np.asarray(single_waveform), np.asarray(single_waveform_filtered)
+        if original.ndim != 1 or original.shape != filtered.shape or original.shape != time.shape:
+            raise ValueError('Both traces must be 1D and match time_ax_waveform.')
+        fig, ax = plt.subplots(figsize=self.settings['figure_size'], layout='constrained')
+        ax.plot(time, original, color=self.get_color('observed'), label='Unfiltered',
+                linewidth=self.settings['line_width'], alpha=0.8)
+        ax.plot(time, filtered, color=self.get_color('synthetic'), label='Filtered',
+                linewidth=self.settings['line_width'])
+        if highlight_window is not None:
+            ax.axvspan(*highlight_window, color=self.get_color('highlight'), alpha=0.22,
+                       label='Direct-arrival window')
+        self._style_data_axes(ax, title, r'Time after trigger [$\mu$s]',
+                              f"Amplitude [{metadata.get('amplitude_unit', 'a.u.')}]")
+        ax.set_xlim(time[0], time[-1])
+        if amplitude_ylim is not None:
+            ax.set_ylim(amplitude_ylim)
+        ax.legend(fontsize=self.settings.get('fontsize_legend', 20), loc='upper right')
         self.output_path_choice(fig=fig, outfile_path=outfile_path)
 
-
-    def amplitude_spectrum_distribution(
-        self,
-        signal_freqs: np.ndarray,
-        amp_spectrum: np.ndarray,
-        metadata: Dict,
-        freq_max: float,
-        outfile_path: Optional[str] = None
-    ) -> None:
-        """
-        Provides alternative visualizations to see how the amplitude spectrum
-        changes across waveforms in the experiment.
-
-        Parameters
-        ----------
-        signal_freqs : np.ndarray
-            Frequencies of the signal (n_samples).
-        amp_spectrum : np.ndarray
-            Amplitude spectrum of shape (n_waveforms, n_samples).
-        metadata : Dict
-            Metadata dictionary containing 'time_ax_acquisition'.
-        freq_max : float
-            Maximum frequency to display on the y-axis (in MHz).
-        outfile_path : str, optional
-            Path to save the resulting figure. If None, the figure is shown.
-
-        Notes
-        -----
-        - This function creates three subplots:
-          1) Line plot (with alpha-blended lines),
-          2) 2D histogram using a log color scale,
-          3) The same 2D histogram using a linear color scale.
-        """
-        if 'time_ax_acquisition' not in metadata:
-            raise KeyError("metadata must contain 'time_ax_acquisition'.")
-
-        # Check dimensions
-        if amp_spectrum.ndim != 2:
-            raise ValueError("amp_spectrum must be a 2D numpy array.")
-        wave_num, wave_len = amp_spectrum.shape
-
-        # Only use half the spectrum if it's symmetrical
-        spectrum_length = wave_len // 2
-        freqs = signal_freqs[:spectrum_length]
-        amps  = amp_spectrum[:, :spectrum_length]
-
-        time_ax_acquisition = metadata['time_ax_acquisition']
-        if len(time_ax_acquisition) != wave_num:
-            raise ValueError("time_ax_acquisition length does not match amp_spectrum waveforms.")
-
-        # Mask to freq_max
-        mask = freqs <= freq_max
-        freqs_cut   = freqs[mask]
-        amps_cut    = amps[:, mask]
-
-        # Prepare colormap
-        cmap_name = self.settings.get('cmap_distribution', 'plasma')
-        cmap = plt.get_cmap(cmap_name)
-
-        # Create subplots
-        fig, axes = plt.subplots(
-            nrows=3,
-            figsize=self.settings['figure_size'],
-            constrained_layout=True
-        )
-
-        # 1) Line plot with alpha
-        axes[0].plot(
-            freqs_cut,
-            amps_cut.T,
-            color=self.get_color('observed'),
-            alpha=0.05,
-            linewidth=self.settings['line_width']
-        )
-        axes[0].set_title(
-            "Line Plot with Alpha",
-            fontsize=self.settings['fontsize_title'],
-            color=self.get_color('primary')
-        )
-        axes[0].set_xlabel(
-            "Frequency [MHz]",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        axes[0].set_ylabel(
-            "Amplitude [a.u.]",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        axes[0].set_xlim([0, freq_max])
-        axes[0].tick_params(
-            axis='both',
-            which='major',
-            labelsize=self.settings['fontsize_ticks'],
-            colors=self.get_color('shadow')
-        )
-        axes[0].grid(alpha=0.1, color=self.get_color('shadow'))
-
-        # Prepare histogram bins
-        freq_flat = np.broadcast_to(freqs_cut, amps_cut.shape).ravel()
-        amp_flat  = amps_cut.ravel()
-        pos_mask  = amp_flat > 0
-        freq_pos  = freq_flat[pos_mask]
-        amp_pos   = amp_flat[pos_mask]
-
-        num_freq_bins = 200
-        num_amp_bins  = 200
-        freq_bins = np.linspace(0, freq_max, num_freq_bins)
-        amp_min, amp_max = amp_pos.min(), amp_pos.max()
-        amp_bins = np.logspace(np.log10(amp_min), np.log10(amp_max), num_amp_bins)
-
-        h, xedges, yedges = np.histogram2d(
-            freq_pos, amp_pos,
-            bins=[freq_bins, amp_bins]
-        )
-
-        # 2) 2D histogram (log colorscale)
-        pcm1 = axes[1].pcolormesh(
-            xedges, yedges, h.T,
-            cmap=cmap,
-            norm=mcolors.LogNorm(vmin=1, vmax=h.max()),
-            rasterized=True
-        )
-        axes[1].set_title(
-            "2D Histogram (Log Colorscale)",
-            fontsize=self.settings['fontsize_title'],
-            color=self.get_color('primary')
-        )
-        axes[1].set_xlabel(
-            "Frequency [MHz]",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        axes[1].set_ylabel(
-            "Amplitude [a.u.]",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        axes[1].set_xlim([0, freq_max])
-        axes[1].set_ylim([amp_min, amp_max])
-        axes[1].tick_params(
-            axis='both',
-            which='major',
-            labelsize=self.settings['fontsize_ticks'],
-            colors=self.get_color('shadow')
-        )
-        axes[1].grid(alpha=0.1, color=self.get_color('shadow'))
-        cbar1 = fig.colorbar(pcm1, ax=axes[1], pad=0.01)
-        cbar1.set_label(
-            "# Points (log scale)",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        cbar1.ax.yaxis.set_tick_params(
-            labelsize=self.settings['fontsize_ticks'],
-            colors=self.get_color('shadow')
-        )
-        plt.setp(cbar1.ax.get_yticklabels(), color=self.get_color('shadow'))
-
-        # 3) 2D histogram (linear colorscale)
-        pcm2 = axes[2].pcolormesh(
-            xedges, yedges, h.T,
-            cmap=cmap,
-            vmax=h.max(),
-            rasterized=True
-        )
-        axes[2].set_title(
-            "2D Histogram (Linear Colorscale)",
-            fontsize=self.settings['fontsize_title'],
-            color=self.get_color('primary')
-        )
-        axes[2].set_xlabel(
-            "Frequency [MHz]",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        axes[2].set_ylabel(
-            "Amplitude [a.u.]",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        axes[2].set_xlim([0, freq_max])
-        axes[2].set_ylim([amp_min, amp_max])
-        axes[2].tick_params(
-            axis='both',
-            which='major',
-            labelsize=self.settings['fontsize_ticks'],
-            colors=self.get_color('shadow')
-        )
-        axes[2].grid(alpha=0.1, color=self.get_color('shadow'))
-        cbar2 = fig.colorbar(pcm2, ax=axes[2], pad=0.01)
-        cbar2.set_label(
-            "# Points (linear scale)",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        cbar2.ax.yaxis.set_tick_params(
-            labelsize=self.settings['fontsize_ticks'],
-            colors=self.get_color('shadow')
-        )
-        plt.setp(cbar2.ax.get_yticklabels(), color=self.get_color('shadow'))
-
-        self.output_path_choice(fig=fig, outfile_path=outfile_path)
-
-    def filtered_amp_and_phase_spectrum_plot(self,
-                                             signal_freqs: np.ndarray,
-                                             amp_spectrum: np.ndarray,
-                                             phase_spectrum: np.ndarray = None,
-                                             filtered_amp_spectrum: np.ndarray = None,
-                                             lowpass_filter: np.ndarray = None,
-                                             freq_max: float = None,
-                                             outfile_path: Optional[str] = None) -> None:
-        """
-        Plots the filtered amplitude and phase spectrum.
-        """
-        if signal_freqs.ndim != 1 or amp_spectrum.ndim != 1:
-            raise ValueError("signal_freqs and amp_spectrum must be 1D arrays.")
-        if len(signal_freqs) != len(amp_spectrum):
-            raise ValueError("signal_freqs and amp_spectrum must have the same length.")
-
-        max_idx = np.argmax(amp_spectrum)
-        max_freq = abs(signal_freqs[max_idx])
-
-        fig, axes = plt.subplots(2, 1, figsize=self.settings['figure_size'])
-
-        # --- Amplitude panel ---
-        ax_amp = axes[0]
-        ax_amp.semilogy(
-            signal_freqs,
-            amp_spectrum,
-            label="Original Spectrum",
-            color=self.get_color('observed'),
-            linewidth=self.settings['line_width']
-        )
-
-        ax_amp.vlines(
-            max_freq,
-            ymin=np.amin(amp_spectrum),
-            ymax=np.amax(amp_spectrum),
-            colors=self.get_color('highlight'),
-            linestyles='--',
-            label=f"Peak @ {max_freq:.2f} MHz"
-        )
-
-        if lowpass_filter is not None and filtered_amp_spectrum is not None:
-            ax_amp.semilogy(
-                signal_freqs,
-                lowpass_filter * np.amax(amp_spectrum),
-                label="Filter Shape",
-                color=self.get_color('accent'),
-                linewidth=self.settings['line_width']
-            )
-            ax_amp.semilogy(
-                signal_freqs,
-                filtered_amp_spectrum,
-                label="Filtered Spectrum",
-                color=self.get_color('synthetic'),
-                linewidth=self.settings['line_width']
-            )
-            if freq_max is not None:
-                ax_amp.vlines(
-                    freq_max,
-                    ymin=np.amin(filtered_amp_spectrum),
-                    ymax=np.amax(filtered_amp_spectrum),
-                    colors=self.get_color('highlight'),
-                    linestyles='-',
-                    label=f"Cut-off = {freq_max:.2f} MHz"
-                )
-
-        ax_amp.set_title(
-            "Amplitude Spectrum",
-            fontsize=self.settings['fontsize_title'],
-            color=self.get_color('primary')
-        )
-        ax_amp.set_xlabel(
-            "Frequency [MHz]",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        ax_amp.set_ylabel(
-            "Amplitude [a.u.]",
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        ax_amp.set_xlim([0, np.max(signal_freqs)])
-        ax_amp.set_ylim([np.min(amp_spectrum), np.max(amp_spectrum)])
-        ax_amp.tick_params(
-            axis='both',
-            which='major',
-            labelsize=self.settings['fontsize_ticks'],
-            colors=self.get_color('shadow')
-        )
-        ax_amp.grid(alpha=0.2, color=self.get_color('shadow'))
-        ax_amp.legend(fontsize=self.settings['fontsize_ticks'], facecolor=self.get_color('background'))
-
-        # --- Phase panel ---
-        ax_ph = axes[1]
-        if phase_spectrum is not None:
-            ax_ph.plot(
-                signal_freqs,
-                phase_spectrum,
-                color=self.get_color('accent'),
-                linewidth=self.settings['line_width']
-            )
-            ax_ph.set_title(
-                "Phase Spectrum",
-                fontsize=self.settings['fontsize_title'],
-                color=self.get_color('primary')
-            )
-            ax_ph.set_xlabel(
-                "Frequency [MHz]",
-                fontsize=self.settings['fontsize_labels'],
-                color=self.get_color('primary')
-            )
-            ax_ph.set_ylabel(
-                "Phase [rad]",
-                fontsize=self.settings['fontsize_labels'],
-                color=self.get_color('primary')
-            )
-            ax_ph.set_xlim([0, np.max(signal_freqs)])
-            ax_ph.set_yticks(np.linspace(-np.pi, np.pi, 5))
-            ax_ph.set_yticklabels(
-                [r'$-\pi$', r'$-\frac{\pi}{2}$', r'$0$', r'$\frac{\pi}{2}$', r'$\pi$'],
-                color=self.get_color('shadow')
-            )
-            ax_ph.tick_params(
-                axis='both',
-                which='major',
-                labelsize=self.settings['fontsize_ticks'],
-                colors=self.get_color('shadow')
-            )
-            ax_ph.grid(alpha=0.2, color=self.get_color('shadow'))
-
-        fig.tight_layout()
-        self.output_path_choice(fig=fig, outfile_path=outfile_path)
-
-    def signal_vs_filtered_signal_plot(self,
-                                       single_waveform: np.ndarray,
-                                       single_waveform_filtered: np.ndarray,
-                                       metadata: Dict,
-                                       freq_max: float,
-                                       outfile_path: Optional[str] = None) -> None:
-        """
-        Plot a comparison between a waveform and its filtered version.
-        """
-        if 'time_ax_waveform' not in metadata:
-            raise KeyError("metadata must contain 'time_ax_waveform'.")
-        if single_waveform.ndim != 1 or single_waveform_filtered.ndim != 1:
-            raise ValueError("single_waveform and single_waveform_filtered must be 1D numpy arrays.")
-        if len(single_waveform) != len(single_waveform_filtered):
-            raise ValueError("single_waveform and single_waveform_filtered must have the same length.")
-
-        time_ax = metadata['time_ax_waveform']
-        fig, ax = plt.subplots(figsize=self.settings['figure_size'])
-
-        # original vs filtered using semantic colors
-        ax.plot(
-            time_ax,
-            single_waveform,
-            color=self.get_color('observed'),
-            label="Original Waveform",
-            linewidth=self.settings['line_width']
-        )
-        ax.plot(
-            time_ax,
-            single_waveform_filtered,
-            color=self.get_color('synthetic'),
-            label="Filtered Waveform",
-            linewidth=self.settings['line_width']
-        )
-
-        ax.set_title(
-            f"Effect of Lowpass Filtering at {freq_max:.2f} MHz",
-            fontsize=self.settings['fontsize_title'],
-            fontname=self.FONT_TYPE,
-            color=self.get_color('primary')
-        )
-        ax.set_xlabel(
-            'Time [$\\mu s$]',
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-        ax.set_ylabel(
-            'Amplitude [a.u.]',
-            fontsize=self.settings['fontsize_labels'],
-            color=self.get_color('primary')
-        )
-
-        ax.legend(
-            fontsize=self.settings['fontsize_ticks'],
-            facecolor=self.get_color('background'),
-            edgecolor=self.get_color('shadow')
-        )
-        ax.tick_params(
-            axis='both',
-            which='major',
-            labelsize=self.settings['fontsize_ticks'],
-            colors=self.get_color('shadow')
-        )
-        ax.grid(alpha=0.3, color=self.get_color('shadow'))
-
-        fig.tight_layout()
-        self.output_path_choice(fig=fig, outfile_path=outfile_path)
 
     def wavelet_selection_plot(self,
                                time: np.ndarray,
@@ -916,6 +629,22 @@ class Plotter:
             raise ValueError("t, sp_simulated, and sp_recorded must have the same length.")
 
         # bump up title/fonts for emphasis
+        # PLOT_MISFIT_MASK_COMPAT_V1
+        # The optimizer may supply sample indices or a boolean selection mask.
+        # Conversion is local to this plot; the objective's interval is unchanged.
+        misfit_interval = np.asarray(misfit_interval)
+        if misfit_interval.ndim != 1:
+            raise ValueError("misfit_interval must be a 1D mask or index array.")
+        if misfit_interval.dtype.kind == 'b':
+            if misfit_interval.size != t.size:
+                raise ValueError("A boolean misfit mask must match the time axis.")
+            misfit_interval = np.flatnonzero(misfit_interval)
+        elif misfit_interval.size:
+            if misfit_interval.dtype.kind not in 'iu':
+                raise ValueError("Misfit sample indices must be integers.")
+            if np.any(misfit_interval < 0) or np.any(misfit_interval >= t.size):
+                raise ValueError("Misfit sample indices are outside the time axis.")
+
         title_fs = int(1.2 * self.settings['fontsize_title'])
         label_fs = int(1.1 * self.settings['fontsize_labels'])
 

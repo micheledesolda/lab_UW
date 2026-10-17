@@ -66,6 +66,38 @@ def _filename_decimal(value: float, places: int = 4) -> str:
     return f"{float(value):.{int(places)}f}".replace(".", ",")
 
 
+def _plot_local_misfit_history(history, output_path, *, spectral_gamma: float) -> None:
+    """Plot evaluated trials and the actually accepted best objective."""
+    if not history:
+        return
+    iterations = np.asarray([row["iteration"] for row in history], dtype=int)
+    best = np.asarray([row["best_misfit"] for row in history], dtype=float)
+    trials = np.asarray([row["trial_misfit"] for row in history], dtype=float)
+    accepted = np.asarray([row["accepted"] for row in history], dtype=bool)
+    evaluated = iterations > 0
+    fig, axis = plt.subplots(figsize=(8, 5), constrained_layout=True)
+    axis.plot(iterations, trials, color="0.65", linewidth=1, label="Trial objective")
+    axis.step(iterations, best, where="post", linewidth=2, label="Best accepted objective")
+    for mask, color, marker, label in (
+        (evaluated & accepted, "tab:green", "o", "Accepted trial"),
+        (evaluated & ~accepted, "tab:red", "x", "Rejected trial"),
+    ):
+        if np.any(mask):
+            axis.scatter(iterations[mask], trials[mask], color=color, marker=marker, label=label, zorder=3)
+    axis.scatter(iterations[0], best[0], color="black", marker="s", label="Initial model", zorder=4)
+    axis.set_xlabel("Iteration")
+    axis.set_ylabel(r"Complete misfit $J_\gamma$")
+    axis.set_title(f"Local inversion: gamma={spectral_gamma:g}, J: {best[0]:.5g} -> {best[-1]:.5g}")
+    axis.grid(alpha=0.25)
+    axis.legend()
+    if iterations.size == 1:
+        axis.set_xlim(-0.5, 0.5)
+    output_path = pathlib.Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+
 def _waveform_interval_indices(interval, size: int) -> np.ndarray:
     """Return validated integer indices for a waveform interval."""
 
@@ -344,6 +376,10 @@ class UltrasonicModeler:
         plot_output_path   : Optional[str] = None,
         movie_output_path  : Optional[str] = "simulation_movie.mp4",
         plot_name_prefix   : str = "",
+        spectral_gamma     : float = 1.0,
+        objective_taper_fraction: float = 0.0,
+        teeth_bank_options: Optional[Dict[str, Any]] = None,
+        teeth_continuous_options: Optional[Dict[str, Any]] = None,
     ) -> Tuple[
         np.ndarray,  # synthetic_waveform
         Optional[np.ndarray],  # wavefield_forward; None in receiver-only mode
@@ -375,6 +411,18 @@ class UltrasonicModeler:
         allocated.  This produces the same synthetic trace and misfit, but
         local inversion and movies still require ``store_wavefield=True``.
         """
+
+        if teeth_bank_options is not None and teeth_continuous_options is not None:
+            raise ValueError('Choose bank or continuous teeth options, not both')
+        if teeth_continuous_options is not None:
+            from lab_uw.teeth_continuous import forward_with_continuous
+            return forward_with_continuous(self, locals())
+        self.teeth_continuous_options = None
+        self.teeth_continuous_metadata = None
+        if teeth_bank_options is not None:
+            from lab_uw.teeth_bank_search import forward_with_bank
+            return forward_with_bank(self, locals())
+        self.teeth_bank_options = None
 
         # Explicitly assign each argument to `self`
         self.geometry_type       = geometry_type
@@ -772,23 +820,24 @@ class UltrasonicModeler:
         #-------------------------------------------
         # COMPUTE MISFIT
         #-------------------------------------------
-        misfit = self.compute_misfit(
-            observed_waveform   = observed_waveform,
-            synthetic_waveform  = synthetic_waveform,
-            misfit_interval     = misfit_interval
+        objective = relative_waveform_objective(
+            observed_waveform,
+            synthetic_waveform,
+            misfit_interval,
+            spectral_gamma=spectral_gamma,
+            taper_fraction=objective_taper_fraction,
+            eps=1.0e-12,
         )
+        misfit = float(objective["total"])
 
 
         # Store results in the instance so we can reuse them
         self.synthetic_waveform     = synthetic_waveform
         self.raw_synthetic_waveform = raw_synthetic_waveform
         self.trace_scale            = float(scale)
-        self.objective_components   = relative_waveform_objective(
-            observed_waveform,
-            synthetic_waveform,
-            misfit_interval,
-            spectral_gamma=1.0,
-        )
+        self.objective_components   = objective
+        self.spectral_gamma = float(spectral_gamma)
+        self.objective_taper_fraction = float(objective_taper_fraction)
         self.wavefield_forward      = wavefield_forward
         self.velocity_model_handler = velocity_model_handler
         self.sim_time_handler       = sim_time_handler
@@ -1049,6 +1098,8 @@ class UltrasonicModeler:
 
     def _require_legacy_adjoint_configuration(self) -> None:
         """Prevent use of the old adjoint with a different forward operator."""
+        if getattr(self, "teeth_bank_options", None) is not None:
+            raise NotImplementedError("The P2 bank forward has no verified multimodal adjoint")
         incompatible = []
         if self.boundary_condition != "legacy_fixed":
             incompatible.append(f"boundary_condition={self.boundary_condition!r}")
@@ -1068,6 +1119,8 @@ class UltrasonicModeler:
 
     def _require_local_model_adjoint_configuration(self) -> None:
         """Accept only model inversions whose discrete adjoint is verified."""
+        if getattr(self, "teeth_bank_options", None) is not None:
+            raise NotImplementedError("The P2 bank forward is currently limited to global search")
         if self.embedding_mode == "legacy_stack":
             self._require_legacy_adjoint_configuration()
             return
@@ -1138,6 +1191,9 @@ class UltrasonicModeler:
         if self.synthetic_waveform is None:
             raise RuntimeError("No forward-simulation results. Call `forward_simulation()` first.")
         self._require_local_model_adjoint_configuration()
+        # KINEMATIC_VELOCITY_LABEL_V1
+        from lab_uw.kinematic_velocity import ensure_reference, update_model_kinematics, filename_label
+        ensure_reference(self)
         use_effective_adjoint = self.embedding_mode == "effective_surface"
         density_before_shrink = self.velocity_model_handler.density_array.copy()
 
@@ -1252,6 +1308,14 @@ class UltrasonicModeler:
         # ------------------------------------------------------------------
         # 3) INITIAL FORWARD + MISFIT
         # ------------------------------------------------------------------
+        if (int(n_iterations) == 0 and self.geometry_type == "dds"
+                and amplitude_scale_mode == "fixed" and not enable_plotting and not make_movie
+                and not retain_wavefield):
+            from lab_uw.material_optimizer import reuse_material_model
+            reuse_material_model(self, scale=fixed_trace_scale, gamma=spectral_gamma,
+                taper=objective_taper_fraction, strategy=update_strategy,
+                dc=dc_max_start, da=da_max_start, objective=relative_waveform_objective)
+            return
         initial_wavefield_forward = pseudospectral_1D_damped(
             num_x=num_x,
             delta_x=delta_x,
@@ -1383,6 +1447,12 @@ class UltrasonicModeler:
 
             # optional lower bound; keep your current logic or replace with a physical one
             vmin_update = max(1e-12, 0.25 * np.min(initial_velocity_model[regions_to_update]))
+            # ADAPTIVE_INDEPENDENT_FIXED_BOUNDS_V1
+            fixed_lower = getattr(self, "independent_velocity_lower_bound_cm_us", None)
+            if fixed_lower is not None:
+                vmin_update = float(fixed_lower)
+                if not np.isfinite(vmin_update) or vmin_update <= 0:
+                    raise ValueError("Independent velocity lower bound must be positive and finite.")
 
             # lower bound on all updated regions
             v_lower[regions_to_update] = vmin_update
@@ -1400,6 +1470,12 @@ class UltrasonicModeler:
 
         elif self.geometry_type == "block":
             vmin_update = max(1e-12, 0.25 * np.min(initial_velocity_model[regions_to_update]))
+            # ADAPTIVE_INDEPENDENT_FIXED_BOUNDS_V1
+            fixed_lower = getattr(self, "independent_velocity_lower_bound_cm_us", None)
+            if fixed_lower is not None:
+                vmin_update = float(fixed_lower)
+                if not np.isfinite(vmin_update) or vmin_update <= 0:
+                    raise ValueError("Independent velocity lower bound must be positive and finite.")
             vmax_update = np.max(initial_velocity_model[regions_to_update])
 
             v_lower[regions_to_update] = vmin_update
@@ -1481,19 +1557,35 @@ class UltrasonicModeler:
             )
             return wavefield, synthetic_waveform, trace_scale, objective
 
+        # SCIENTIFIC_LOCAL_STOP_V1
+        from lab_uw.adaptive_stopping import make_monitor
+        # SEARCHED_MATERIAL_OPTIMIZER_V3
+        from copy import deepcopy
+        from lab_uw.material_optimizer import make_optimizer
+        material_optimizer = make_optimizer(
+            getattr(self, "optimization_policy", None) if use_effective_adjoint else None,
+            best_velocity_model, best_damping_model, regions_to_update, v_lower, v_upper,
+            activate_velocity, activate_damping, resume=getattr(self, "optimization_resume_state", None),
+        )
+        scientific_monitor = make_monitor(getattr(self, "scientific_stop_policy", None), best_misfit, spectral_gamma, getattr(self, "scientific_stop_resume_state", None)) if material_optimizer is None else None
+        scientific_fallback_reason = "budget_exhausted"
+
         for iteration in range(n_iterations):
+            if scientific_monitor is not None and scientific_monitor.before_iteration(best_misfit):
+                break
             velocity_available = bool(
-                activate_velocity and dc_max >= dc_threshold
+                activate_velocity and (material_optimizer is not None or dc_max >= dc_threshold)
             )
             damping_available = bool(
-                activate_damping and da_max >= da_threshold
+                activate_damping and (material_optimizer is not None or da_max >= da_threshold)
             )
             if not velocity_available and not damping_available:
+                scientific_fallback_reason = "step_limits_below_threshold"
                 print("Stopping: active step sizes below thresholds.")
                 break
 
             if update_strategy == "alternating":
-                parameter_block = "velocity" if iteration % 2 == 0 else "damping"
+                parameter_block = "velocity" if (iteration + (scientific_monitor.iteration_offset if scientific_monitor is not None else 0)) % 2 == 0 else "damping"
                 if parameter_block == "velocity" and not velocity_available:
                     parameter_block = "damping"
                 elif parameter_block == "damping" and not damping_available:
@@ -1589,151 +1681,72 @@ class UltrasonicModeler:
             # ------------------------------------------------------------------
             # FORM THE TWO PARAMETER-BLOCK PROPOSALS INDEPENDENTLY
             # ------------------------------------------------------------------
-            velocity_proposal = best_velocity_model.copy()
-            damping_proposal = best_damping_model.copy()
-
-            if velocity_available:
-                step_size_vel = dc_max / (max_vel_grad + 1e-15)
-                direction = -1.0 if use_effective_adjoint else 1.0
-                velocity_proposal[regions_to_update] += (
-                    direction * step_size_vel * gradient_vel[regions_to_update]
+            if material_optimizer is not None:
+                searched = material_optimizer.search(
+                    best_velocity_model, best_damping_model, gradient_vel, gradient_damp,
+                    best_misfit, _evaluate_receiver_only_candidate,
                 )
-
-                velocity_proposal[regions_to_update] = np.clip(
-                    velocity_proposal[regions_to_update],
-                    v_lower[regions_to_update],
-                    v_upper[regions_to_update],
-                )
-
-            if damping_available:
-                step_size_damp = da_max / (max_damp_grad + 1e-15)
-                direction = -1.0 if use_effective_adjoint else 1.0
-                damping_proposal[regions_to_update] += (
-                    direction * step_size_damp * gradient_damp[regions_to_update]
-                )
-
-                damping_proposal[regions_to_update] = np.clip(
-                    damping_proposal[regions_to_update],
-                    0.0,
-                    None,
-                )
-
-            velocity_only_misfit = None
-            damping_only_misfit = None
-            joint_misfit = None
-            cross_talk_interaction = None
-            selected_candidate = parameter_block
-            wavefield_forward_updated = None
-
-            if update_strategy == "joint":
-                updated_velocity_model = (
-                    velocity_proposal if velocity_available
-                    else best_velocity_model
-                )
-                updated_damping_model = (
-                    damping_proposal if damping_available
-                    else best_damping_model
-                )
-                (
-                    wavefield_forward_updated,
-                    updated_synthetic_waveform,
-                    updated_trace_scale,
-                    updated_objective,
-                ) = _evaluate_full_candidate(
-                    updated_velocity_model,
-                    updated_damping_model,
-                )
-                updated_misfit = float(updated_objective["total"])
+                selected_candidate = searched["selected"]
+                updated_velocity_model = searched["velocity"]
+                updated_damping_model = searched["damping"]
+                updated_misfit = searched["misfit"]
+                velocity_only_misfit = damping_only_misfit = cross_talk_interaction = None
                 joint_misfit = updated_misfit
-
-            elif update_strategy == "alternating":
-                if parameter_block == "velocity":
-                    updated_velocity_model = velocity_proposal
-                    updated_damping_model = best_damping_model
-                else:
-                    updated_velocity_model = best_velocity_model
-                    updated_damping_model = damping_proposal
-                (
-                    wavefield_forward_updated,
-                    updated_synthetic_waveform,
-                    updated_trace_scale,
-                    updated_objective,
-                ) = _evaluate_full_candidate(
-                    updated_velocity_model,
-                    updated_damping_model,
-                )
-                updated_misfit = float(updated_objective["total"])
-                if parameter_block == "velocity":
-                    velocity_only_misfit = updated_misfit
-                else:
-                    damping_only_misfit = updated_misfit
-
-            else:
-                candidate_results = {}
-                if velocity_available:
-                    candidate_results["velocity"] = (
-                        velocity_proposal,
-                        best_damping_model,
-                        _evaluate_receiver_only_candidate(
-                            velocity_proposal,
-                            best_damping_model,
-                        ),
-                    )
-                    velocity_only_misfit = float(
-                        candidate_results["velocity"][2][2]["total"]
-                    )
-                if damping_available:
-                    candidate_results["damping"] = (
-                        best_velocity_model,
-                        damping_proposal,
-                        _evaluate_receiver_only_candidate(
-                            best_velocity_model,
-                            damping_proposal,
-                        ),
-                    )
-                    damping_only_misfit = float(
-                        candidate_results["damping"][2][2]["total"]
-                    )
-                if velocity_available and damping_available:
-                    candidate_results["joint"] = (
-                        velocity_proposal,
-                        damping_proposal,
-                        _evaluate_receiver_only_candidate(
-                            velocity_proposal,
-                            damping_proposal,
-                        ),
-                    )
-                    joint_misfit = float(
-                        candidate_results["joint"][2][2]["total"]
-                    )
-
-                selection = select_cross_talk_candidate(
-                    current_misfit=best_misfit,
-                    velocity_only_misfit=velocity_only_misfit,
-                    damping_only_misfit=damping_only_misfit,
-                    joint_misfit=joint_misfit,
-                )
-                selected_candidate = selection["selected"]
-                cross_talk_interaction = selection["interaction"]
-                finite_trial_misfits = [
-                    value for value in (
-                        velocity_only_misfit,
-                        damping_only_misfit,
-                        joint_misfit,
-                    )
-                    if value is not None and np.isfinite(value)
-                ]
-                updated_misfit = (
-                    min(finite_trial_misfits)
-                    if finite_trial_misfits else best_misfit
-                )
-
+                wavefield_forward_updated = None
                 if selected_candidate != "current":
-                    (
-                        updated_velocity_model,
-                        updated_damping_model,
-                        receiver_only_result,
-                    ) = candidate_results[selected_candidate]
+                    (wavefield_forward_updated, updated_synthetic_waveform,
+                     updated_trace_scale, updated_objective) = _evaluate_full_candidate(
+                        updated_velocity_model, updated_damping_model)
+                    full_misfit = float(updated_objective["total"])
+                    if not np.isclose(full_misfit, updated_misfit, rtol=1e-9, atol=1e-12):
+                        raise RuntimeError("Searched receiver-only and full-field objectives disagree.")
+                    updated_misfit = full_misfit
+            else:
+                velocity_proposal = best_velocity_model.copy()
+                damping_proposal = best_damping_model.copy()
+
+                if velocity_available:
+                    step_size_vel = dc_max / (max_vel_grad + 1e-15)
+                    direction = -1.0 if use_effective_adjoint else 1.0
+                    velocity_proposal[regions_to_update] += (
+                        direction * step_size_vel * gradient_vel[regions_to_update]
+                    )
+
+                    velocity_proposal[regions_to_update] = np.clip(
+                        velocity_proposal[regions_to_update],
+                        v_lower[regions_to_update],
+                        v_upper[regions_to_update],
+                    )
+
+                if damping_available:
+                    step_size_damp = da_max / (max_damp_grad + 1e-15)
+                    direction = -1.0 if use_effective_adjoint else 1.0
+                    damping_proposal[regions_to_update] += (
+                        direction * step_size_damp * gradient_damp[regions_to_update]
+                    )
+
+                    damping_proposal[regions_to_update] = np.clip(
+                        damping_proposal[regions_to_update],
+                        0.0,
+                        None,
+                    )
+
+                velocity_only_misfit = None
+                damping_only_misfit = None
+                joint_misfit = None
+                cross_talk_interaction = None
+                selected_candidate = parameter_block
+                wavefield_forward_updated = None
+
+                if update_strategy == "joint":
+                    updated_velocity_model = (
+                        velocity_proposal if velocity_available
+                        else best_velocity_model
+                    )
+                    updated_damping_model = (
+                        damping_proposal if damping_available
+                        else best_damping_model
+                    )
                     (
                         wavefield_forward_updated,
                         updated_synthetic_waveform,
@@ -1744,19 +1757,119 @@ class UltrasonicModeler:
                         updated_damping_model,
                     )
                     updated_misfit = float(updated_objective["total"])
-                    receiver_only_misfit = float(
-                        receiver_only_result[2]["total"]
+                    joint_misfit = updated_misfit
+
+                elif update_strategy == "alternating":
+                    if parameter_block == "velocity":
+                        updated_velocity_model = velocity_proposal
+                        updated_damping_model = best_damping_model
+                    else:
+                        updated_velocity_model = best_velocity_model
+                        updated_damping_model = damping_proposal
+                    (
+                        wavefield_forward_updated,
+                        updated_synthetic_waveform,
+                        updated_trace_scale,
+                        updated_objective,
+                    ) = _evaluate_full_candidate(
+                        updated_velocity_model,
+                        updated_damping_model,
                     )
-                    if not np.isclose(
-                        updated_misfit,
-                        receiver_only_misfit,
-                        rtol=1e-9,
-                        atol=1e-12,
-                    ):
-                        raise RuntimeError(
-                            "receiver-only and full-wavefield forwards gave "
-                            "different candidate objectives"
+                    updated_misfit = float(updated_objective["total"])
+                    if parameter_block == "velocity":
+                        velocity_only_misfit = updated_misfit
+                    else:
+                        damping_only_misfit = updated_misfit
+
+                else:
+                    candidate_results = {}
+                    if velocity_available:
+                        candidate_results["velocity"] = (
+                            velocity_proposal,
+                            best_damping_model,
+                            _evaluate_receiver_only_candidate(
+                                velocity_proposal,
+                                best_damping_model,
+                            ),
                         )
+                        velocity_only_misfit = float(
+                            candidate_results["velocity"][2][2]["total"]
+                        )
+                    if damping_available:
+                        candidate_results["damping"] = (
+                            best_velocity_model,
+                            damping_proposal,
+                            _evaluate_receiver_only_candidate(
+                                best_velocity_model,
+                                damping_proposal,
+                            ),
+                        )
+                        damping_only_misfit = float(
+                            candidate_results["damping"][2][2]["total"]
+                        )
+                    if velocity_available and damping_available:
+                        candidate_results["joint"] = (
+                            velocity_proposal,
+                            damping_proposal,
+                            _evaluate_receiver_only_candidate(
+                                velocity_proposal,
+                                damping_proposal,
+                            ),
+                        )
+                        joint_misfit = float(
+                            candidate_results["joint"][2][2]["total"]
+                        )
+
+                    selection = select_cross_talk_candidate(
+                        current_misfit=best_misfit,
+                        velocity_only_misfit=velocity_only_misfit,
+                        damping_only_misfit=damping_only_misfit,
+                        joint_misfit=joint_misfit,
+                    )
+                    selected_candidate = selection["selected"]
+                    cross_talk_interaction = selection["interaction"]
+                    finite_trial_misfits = [
+                        value for value in (
+                            velocity_only_misfit,
+                            damping_only_misfit,
+                            joint_misfit,
+                        )
+                        if value is not None and np.isfinite(value)
+                    ]
+                    updated_misfit = (
+                        min(finite_trial_misfits)
+                        if finite_trial_misfits else best_misfit
+                    )
+
+                    if selected_candidate != "current":
+                        (
+                            updated_velocity_model,
+                            updated_damping_model,
+                            receiver_only_result,
+                        ) = candidate_results[selected_candidate]
+                        (
+                            wavefield_forward_updated,
+                            updated_synthetic_waveform,
+                            updated_trace_scale,
+                            updated_objective,
+                        ) = _evaluate_full_candidate(
+                            updated_velocity_model,
+                            updated_damping_model,
+                        )
+                        updated_misfit = float(updated_objective["total"])
+                        receiver_only_misfit = float(
+                            receiver_only_result[2]["total"]
+                        )
+                        if not np.isclose(
+                            updated_misfit,
+                            receiver_only_misfit,
+                            rtol=1e-9,
+                            atol=1e-12,
+                        ):
+                            raise RuntimeError(
+                                "receiver-only and full-wavefield forwards gave "
+                                "different candidate objectives"
+                            )
 
             trial_was_accepted = bool(
                 selected_candidate != "current"
@@ -1768,8 +1881,11 @@ class UltrasonicModeler:
             # ACCEPT / REJECT AND ADAPT EACH BLOCK STEP INDEPENDENTLY
             # ------------------------------------------------------------------
             if trial_was_accepted:
+                if material_optimizer is not None:
+                    dc_max = float(np.max(np.abs(updated_velocity_model[regions_to_update] - best_velocity_model[regions_to_update])))
+                    da_max = float(np.max(np.abs(updated_damping_model[regions_to_update] - best_damping_model[regions_to_update])))
                 updating = True
-                print(f"    Accepted [{selected_candidate}]")
+                print(f"    Iteration {iteration}/{n_iterations}:   Accepted [{selected_candidate}]")
 
                 best_velocity_model = updated_velocity_model
                 best_damping_model = updated_damping_model
@@ -1806,6 +1922,7 @@ class UltrasonicModeler:
                     da_max /= reduce_factor
 
             misfit_gap = updated_misfit - old_best_misfit
+            # print(f"misfit gap: {misfit_gap}")
             local_iteration_history.append({
                 "iteration": int(iteration + 1),
                 "trial_misfit": float(updated_misfit),
@@ -1820,16 +1937,32 @@ class UltrasonicModeler:
                 "velocity_step_limit": float(dc_max),
                 "damping_step_limit": float(da_max),
             })
+            if material_optimizer is not None:
+                local_iteration_history[-1]["optimizer_search"] = deepcopy(material_optimizer.last_info)
+                if material_optimizer.observe(accepted=trial_was_accepted, best_misfit=best_misfit,
+                        iteration=iteration+1+material_optimizer.iteration_offset):
+                    break
 
             # Drop the trial binding before the next allocation.  When the
             # trial was accepted, best_wavefield_forward retains the array.
             if wavefield_forward_updated is not None:
                 del wavefield_forward_updated
+            if scientific_monitor is not None:
+                scientific_action = scientific_monitor.observe(
+                    best_misfit=best_misfit, accepted=trial_was_accepted,
+                    velocity_step=dc_max, damping_step=da_max, iteration=iteration+1+scientific_monitor.iteration_offset)
+                if scientific_action.get("probe", False):
+                    dc_max = scientific_action["velocity_step"]
+                    da_max = scientific_action["damping_step"]
+                    updating = True
+                    print("    Plateau check: probing another step size.")
+                if scientific_action.get("stop", False):
+                    break
 
             if (
-                update_strategy == "joint"
+                (update_strategy == "joint"
                 and not trial_was_accepted
-                and 0.0 <= misfit_gap < misfit_threshold
+                and 0.0 <= misfit_gap < misfit_threshold) and scientific_monitor is None and material_optimizer is None
             ):
                 print("Stopping: rejected step is too close to current best misfit.")
                 break
@@ -1837,6 +1970,14 @@ class UltrasonicModeler:
         # ------------------------------------------------------------------
         # WRITE BACK BEST RESULT
         # ------------------------------------------------------------------
+        if material_optimizer is not None:
+            self.local_stop_diagnostics = material_optimizer.finish(
+                scientific_fallback_reason, dc_max, da_max, dc_threshold, da_threshold,
+                getattr(self, "optimization_noise_level", None))
+        else:
+            self.local_stop_diagnostics = None if scientific_monitor is None else scientific_monitor.finish(scientific_fallback_reason, dc_max, da_max, dc_threshold, da_threshold)
+        if self.local_stop_diagnostics is not None:
+            print("    Local stop:", self.local_stop_diagnostics["reason"])
         self.synthetic_waveform = best_synthetic_waveform
         self.trace_scale = float(best_trace_scale)
         if amplitude_scale_mode == "fixed":
@@ -1872,10 +2013,17 @@ class UltrasonicModeler:
             )
 
             damping_label = str(round(self.average_gouge_damping, 5)).replace(".", ",")
-            velocity_label = str(round(1e4 * self.average_gouge_velocity)).replace(".", ",")
+            native_best_trace = sample_receiver(
+                best_wavefield_forward, best_receiver_spatial_function,
+                quantity=self.receiver_quantity, delta_t=delta_t, delta_x=delta_x,
+                velocity_model=best_velocity_model, damping_model=best_damping_model,
+                density_model=initial_density_model,
+            )
+            update_model_kinematics(self, native_trace=native_best_trace)
+            velocity_label = filename_label(self)
             misfit_label = _filename_decimal(best_misfit, 4)
             label = (
-                f"_vel_{velocity_label}_damping_{damping_label}"
+                f"_{velocity_label}_damping_{damping_label}"
                 f"_FWI_misfit_{misfit_label}"
             )
         else:
@@ -1917,6 +2065,12 @@ class UltrasonicModeler:
                     outfile_path=damping_model_output_path,
                     quantity="damping",
                 )
+
+            _plot_local_misfit_history(
+                self.local_inversion_history,
+                record_output_directory / f"{waveform_output_path.name}_misfit_vs_iterations.png",
+                spectral_gamma=self.spectral_gamma,
+            )
 
             plt.close('all')
 

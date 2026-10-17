@@ -146,9 +146,69 @@ class UltrasonicDataHandler:
     def metadata(self, v): self.frame.metadata = v
 
     # --------- small processors (µs units) ----------
-    def remove_mean(self) -> "UltrasonicDataHandler":
-        self.frame.waveform_data = self.frame.waveform_data - np.mean(self.frame.waveform_data)
+    def remove_mean(self, *, per_waveform: bool = False) -> "UltrasonicDataHandler":
+        """Remove the global mean, or each trace's mean when requested."""
+        axis = -1 if per_waveform else None
+        self.frame.waveform_data = self.frame.waveform_data - np.mean(
+            self.frame.waveform_data, axis=axis, keepdims=per_waveform
+        )
         return self
+
+    def select_waveform_window(
+        self, t_min_us: float, t_max_us: float
+    ) -> "UltrasonicDataHandler":
+        """Keep samples in the inclusive interval; preserve absolute trace time.
+
+        This selects samples *within each trace*, unlike
+        select_by_time_ax_acquisition(), which selects entire acquisitions.
+        Apply zero-phase filters to the full record before this operation.
+        """
+        t = np.asarray(self.metadata["time_ax_waveform"], dtype=float)
+        lo, hi = float(t_min_us), float(t_max_us)
+        if not np.isfinite([lo, hi]).all() or not lo < hi:
+            raise ValueError("Require finite t_min_us < t_max_us.")
+        if t.ndim != 1 or t.size != self.waveform_data.shape[-1] or t.size < 2:
+            raise ValueError("time_ax_waveform must match the trace sample axis.")
+        if not np.isfinite(t).all() or np.any(np.diff(t) <= 0):
+            raise ValueError("time_ax_waveform must be finite and strictly increasing.")
+        tolerance = 0.5 * float(np.median(np.diff(t)))
+        if lo < t[0] - tolerance or hi > t[-1] + tolerance:
+            raise ValueError(
+                f"Requested window [{lo:g}, {hi:g}] us is outside the record "
+                f"[{t[0]:g}, {t[-1]:g}] us. Check the direct-arrival limits."
+            )
+        start = int(np.searchsorted(t, lo, side="left"))
+        stop = int(np.searchsorted(t, hi, side="right"))
+        if stop - start < 4:
+            raise ValueError("The selected trace window must contain at least 4 samples.")
+        self.frame.waveform_data = self.waveform_data[:, start:stop]
+        self.metadata["time_ax_waveform"] = t[start:stop]
+        self.metadata["number_of_samples"] = stop - start
+        self.metadata["waveform_window_min_us"] = lo
+        self.metadata["waveform_window_max_us"] = hi
+        return self
+
+    def consecutive_differences(self) -> "UltrasonicDataHandler":
+        """Return u[i+1] - u[i], without alignment or amplitude normalization.
+
+        Subtraction is performed before any display thinning. Each difference
+        is assigned to the midpoint of its two acquisition times. Acquisition
+        time units are preserved, just as in the input metadata.
+        """
+        data = np.asarray(self.waveform_data, dtype=float)
+        if data.ndim != 2 or data.shape[0] < 2:
+            raise ValueError("Consecutive differences require at least two traces.")
+        times = np.asarray(self.metadata["time_ax_acquisition"], dtype=float)
+        if times.shape != (data.shape[0],) or not np.isfinite(times).all():
+            raise ValueError("Acquisition times must match waveform rows and be finite.")
+        if np.any(np.diff(times) <= 0):
+            raise ValueError("Acquisition times must be strictly increasing.")
+        metadata = dict(self.metadata)
+        metadata["number_of_waveforms"] = data.shape[0] - 1
+        metadata["time_ax_acquisition"] = times[:-1] + 0.5 * np.diff(times)
+        metadata["difference_definition"] = "next_minus_current"
+        metadata["difference_time_reference"] = "pair_midpoint"
+        return type(self)(np.diff(data, axis=0), metadata)
 
     def downsample_waveforms(self, number_of_waveforms2process: Optional[int]) -> "UltrasonicDataHandler":
         if not number_of_waveforms2process: return self
@@ -353,19 +413,71 @@ class UltrasonicDataHandler:
         return self
 
     # --------- spectra ----------
-    def compute_amplitude_phase_spectrum(self) -> tuple:
+    def compute_amplitude_phase_spectrum(
+        self,
+        *,
+        remove_mean: bool = False,
+        taper_fraction: float = 0.0,
+        nfft: Optional[int] = None,
+    ) -> tuple:
+        """Return unnormalized |rFFT| and phase, with frequency in MHz.
+
+        Defaults preserve the original transform. ``taper_fraction`` is the
+        total Tukey fraction (alpha), shared by both ends, not per end.
+        Zero padding interpolates the spectrum; it adds no spectral resolution.
+        Neither peak normalization nor energy normalization is performed.
+
+        Calls without processing options execute the original implementation,
+        including its metadata handling, to preserve existing script behavior.
+        """
+        if not remove_mean and taper_fraction == 0.0 and nfft is None:
+            # Keep the original no-argument implementation verbatim. Older
+            # callers may crop data without updating time_ax_waveform; this
+            # path historically needed only the sampling interval.
+            if self.waveform_data.size == 0:
+                raise ValueError("No waveform data is present to compute spectra.")
+            data_2d = self.waveform_data
+            n_samples = data_2d.shape[-1]
+            if "sampling_rate" not in self.metadata:
+                raise KeyError("metadata does not contain 'sampling_rate' key.")
+            dt = float(self.metadata["sampling_rate"])
+            self.frequencies = np.fft.rfftfreq(n_samples, d=dt)
+            try:
+                fft_data = np.fft.rfft(data_2d, axis=1)
+            except Exception:
+                fft_data = np.fft.rfft(data_2d)
+            self.amplitude_spectrum = np.abs(fft_data)
+            self.phase_spectrum = np.angle(fft_data)
+            return self.frequencies, self.amplitude_spectrum, self.phase_spectrum
+
         if self.waveform_data.size == 0:
             raise ValueError("No waveform data is present to compute spectra.")
-        data_2d = self.waveform_data
+        data_2d = np.asarray(self.waveform_data, dtype=float)
         n_samples = data_2d.shape[-1]
         if "sampling_rate" not in self.metadata:
             raise KeyError("metadata does not contain 'sampling_rate' key.")
         dt = float(self.metadata["sampling_rate"])        # µs/sample
-        self.frequencies = np.fft.rfftfreq(n_samples, d=dt)
-        try:
-            fft_data = np.fft.rfft(data_2d, axis=1)
-        except Exception:
-            fft_data = np.fft.rfft(data_2d)
+        if not np.isfinite(dt) or dt <= 0:
+            raise ValueError("sampling_rate must be a finite positive interval in us.")
+        if not 0.0 <= taper_fraction <= 1.0:
+            raise ValueError("taper_fraction must lie in [0, 1].")
+        if nfft is None:
+            nfft = n_samples
+        if not isinstance(nfft, (int, np.integer)) or nfft < n_samples:
+            raise ValueError("nfft must be an integer >= the number of samples.")
+        if "time_ax_waveform" in self.metadata:
+            time = np.asarray(self.metadata["time_ax_waveform"], dtype=float)
+            if time.shape != (n_samples,) or not np.isfinite(time).all():
+                raise ValueError("time_ax_waveform must match the samples and be finite.")
+            if not np.allclose(np.diff(time), dt, rtol=1e-5, atol=1e-10):
+                raise ValueError("FFT requires uniform trace times consistent with sampling_rate.")
+        if remove_mean:
+            data_2d = data_2d - data_2d.mean(axis=-1, keepdims=True)
+        if taper_fraction:
+            from scipy.signal.windows import tukey
+            data_2d = data_2d * tukey(n_samples, alpha=taper_fraction)
+        self.frequencies = np.fft.rfftfreq(nfft, d=dt)
+        fft_data = np.fft.rfft(data_2d, n=nfft, axis=-1)
         self.amplitude_spectrum = np.abs(fft_data)
         self.phase_spectrum = np.angle(fft_data)
         return self.frequencies, self.amplitude_spectrum, self.phase_spectrum

@@ -1,0 +1,95 @@
+{
+  "steel": {
+    "metal": "steel",
+    "coarse_nx": 80,
+    "nx": 160,
+    "ntrace": 80,
+    "nmodes_per_reference": 360,
+    "sectors": [
+      {
+        "parity": 1,
+        "full_dof": 12960,
+        "boundary_modes": 320,
+        "interior_modes": 800,
+        "reduced_dof": 1120
+      },
+      {
+        "parity": -1,
+        "full_dof": 12960,
+        "boundary_modes": 320,
+        "interior_modes": 800,
+        "reduced_dof": 1120
+      }
+    ],
+    "nstatic": 80,
+    "height_mm": 0.5,
+    "pitch_mm": 1.0,
+    "eta_default_per_us": 0.02,
+    "density_domain_g_cm3": [
+      1.5,
+      3.0
+    ],
+    "cs_domain_mm_us": [
+      0.8,
+      1.8
+    ],
+    "nu_domain": [
+      0.15,
+      0.45
+    ],
+    "frequency_band_mhz": [
+      0.0,
+      8.0
+    ],
+    "physical_damping": 0.0,
+    "basis_fixed": true,
+    "note": "Galerkin approximation of original P2 operator, not a statistical fit of bank entries"
+  },
+  "titanium": {
+    "metal": "titanium",
+    "coarse_nx": 80,
+    "nx": 160,
+    "ntrace": 80,
+    "nmodes_per_reference": 360,
+    "sectors": [
+      {
+        "parity": 1,
+        "full_dof": 12960,
+        "boundary_modes": 320,
+        "interior_modes": 800,
+        "reduced_dof": 1120
+      },
+      {
+        "parity": -1,
+        "full_dof": 12960,
+        "boundary_modes": 320,
+        "interior_modes": 800,
+        "reduced_dof": 1120
+      }
+    ],
+    "nstatic": 80,
+    "height_mm": 0.5,
+    "pitch_mm": 1.0,
+    "eta_default_per_us": 0.02,
+    "density_domain_g_cm3": [
+      1.5,
+      3.0
+    ],
+    "cs_domain_mm_us": [
+      0.8,
+      1.8
+    ],
+    "nu_domain": [
+      0.15,
+      0.45
+    ],
+    "frequency_band_mhz": [
+      0.0,
+      8.0
+    ],
+    "physical_damping": 0.0,
+    "basis_fixed": true,
+    "note": "Galerkin approximation of original P2 operator, not a statistical fit of bank entries"
+  },
+  "elapsed_seconds": 120.4821322209998
+}

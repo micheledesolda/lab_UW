@@ -32,7 +32,7 @@ from lab_uw.forward_modeling import *
 from lab_uw.plotting import Plotter
 from lab_uw.forward_modeling import UltrasonicModeler
 from lab_uw.inversion_windows import direct_misfit_interval, sample_interval_mask
-from lab_uw.impedance_search import material_candidates, centered_refined_axis
+from lab_uw.impedance_search import material_candidates
 from lab_uw.gouge_thickness import (
     build_constant_total_thickness_candidates,
     select_thickness_minimum,
@@ -40,6 +40,14 @@ from lab_uw.gouge_thickness import (
 from lab_uw.joint_kinematic import build_joint_constant_time_candidates
 from lab_uw.velocity_contrast import build_constant_time_contrast_candidates
 from lab_uw.utils import *
+
+from lab_uw.orchestration_selection import (
+    preprocessing_waveform_count, select_mechanical_records, validate_polarization,
+)
+
+from lab_uw.orchestration_restart import (
+    continue_saved_waveform, enrich_local_checkpoint, restart_requested,
+)
 
 def resolve_worker_count(
     params: Dict[str, Any],
@@ -60,6 +68,51 @@ def resolve_worker_count(
             max(1, int(requested_workers)),
         )
     return min(available_workers, number_of_tasks)
+
+
+def _global_objective_options(params: Dict[str, Any]) -> Dict[str, float]:
+    """Use the existing complete waveform objective in all three global grids."""
+    return {
+        "spectral_gamma": float(params.get(
+            "global_spectral_gamma", params.get("local_spectral_gamma", 1.0)
+        )),
+        "objective_taper_fraction": float(params.get(
+            "global_objective_taper_fraction", params.get("local_objective_taper_fraction", 0.0)
+        )),
+    }
+
+
+def _write_global_best_spectra(simulation, params, output_path, save_plot):
+    return simulation.write_direct_arrival_spectral_diagnostics(
+        output_directory=(output_path if save_plot and params.get("spectral_diagnostics_enabled", True) else None),
+        frequency_min_mhz=float(params.get("frequency_min", 0.0)),
+        frequency_max_mhz=float(params["frequency_cutoff"]),
+    )
+
+
+def _plot_homogeneous_search_maps(results, output_path, *, spectral_gamma):
+    """Write complete-objective and diagnostic-only velocity/damping maps."""
+    velocities = np.unique([row[0] for row in results])
+    damping = np.unique([row[3] for row in results])
+    for metric_index, filename, label in (
+        (1, "complete_misfit.png", rf"$J_\gamma$ ($\gamma={spectral_gamma:g}$)"),
+        (4, "spectral_shape_distance.png", r"Spectral distance $D_f$"),
+    ):
+        grid = np.full((velocities.size, damping.size), np.nan)
+        for row in results:
+            iy = np.searchsorted(velocities, row[0])
+            ix = np.searchsorted(damping, row[3])
+            grid[iy, ix] = row[metric_index]
+        best = min(results, key=lambda row: row[metric_index])
+        fig, axis = plt.subplots(figsize=(7, 5), constrained_layout=True)
+        mesh = axis.pcolormesh(damping, 1.e4 * velocities, grid, shading="auto")
+        axis.scatter(best[3], 1.e4 * best[0], marker="*", s=140, color="white", edgecolor="black")
+        axis.set_xlabel(r"Damping $\nu_g$")
+        axis.set_ylabel(r"Velocity $c_g$ [m/s]")
+        axis.set_title(f"Homogeneous search: {label}")
+        fig.colorbar(mesh, ax=axis, label=label)
+        fig.savefig(Path(output_path) / filename, dpi=200)
+        plt.close(fig)
 
 
 def extract_gouge_profiles(sim) -> Dict[str, Any]:
@@ -287,37 +340,27 @@ def plot_gouge_layer_colormap_with_shear(
     plt.close(fig)
 
 def plot_shear_and_avg_velocity_from_pickle(pkl_path: Path, out_png: Path) -> None:
-    rows = load_pickle_stream(pkl_path)
-
-    # Keep rows that have time + shear stress + avg velocity
-    rows2 = []
-    for r in rows:
-        if ("acquisition_time_s" in r) and ("shear_stress_MPa" in r):
-            # avg_gouge_velocity exists only after local inversion in your schema
-            if "avg_gouge_velocity" in r:
-                if np.isfinite(_safe_float(r["avg_gouge_velocity"])):
-                    rows2.append(r)
-
-    if not rows2:
-        raise RuntimeError("No rows with avg_gouge_velocity found in pickle. Did local inversion run/save?")
-
-    rows2.sort(key=lambda r: _safe_float(r["acquisition_time_s"]))
-
-    t = np.array([_safe_float(r["acquisition_time_s"]) for r in rows2])
-    shear = np.array([_safe_float(r["shear_stress_MPa"]) for r in rows2])
-    vavg = np.array([_safe_float(r["avg_gouge_velocity"]) for r in rows2])
-
+    rows = [r for r in load_pickle_stream(pkl_path)
+            if "acquisition_time_s" in r and "shear_stress_MPa" in r and "avg_gouge_velocity" in r]
+    if not rows:
+        raise RuntimeError("No local velocity rows found in pickle.")
+    rows.sort(key=lambda r: _safe_float(r["acquisition_time_s"]))
+    t = np.array([_safe_float(r["acquisition_time_s"]) for r in rows])
+    shear = np.array([_safe_float(r["shear_stress_MPa"]) for r in rows])
+    mean = np.array([1e4 * _safe_float(r["avg_gouge_velocity"]) for r in rows])
+    kin = np.array([_safe_float(r.get("kinematic_velocity_m_s")) for r in rows])
     fig, ax1 = plt.subplots()
     ax2 = ax1.twinx()
-
-    ax1.plot(t, shear)
-    ax2.plot(t, vavg)
-
+    ax1.plot(t, shear, color="tab:orange", label="Shear stress")
+    ax2.plot(t, mean, "--", color="0.6", label="Arithmetic mean of model parameters")
+    ax2.plot(t, kin, color="tab:blue", marker=".", label="Arrival-equivalent gouge velocity")
     ax1.set_xlabel("Time (s)")
     ax1.set_ylabel("Shear stress (MPa)")
-    ax2.set_ylabel("Average gouge velocity (cm/µs)")
+    ax2.set_ylabel("Gouge velocity [m/s]")
+    ax2.legend(loc="best")
+    if not np.isfinite(kin).any():
+        ax2.set_title("Kinematic velocity unavailable in saved records")
     ax1.grid(True, which="both", linestyle="--", linewidth=0.5)
-
     fig.tight_layout()
     fig.savefig(out_png, dpi=200)
     plt.close(fig)
@@ -844,6 +887,10 @@ def _build_local_result_row(
     result_row["local_continuation_state"] = (
         _capture_local_continuation_state(assembly_dict, simulation)
     )
+    result_row["local_stopping"] = deepcopy(getattr(simulation, "local_stop_diagnostics", None))
+    # KINEMATIC_VELOCITY_LABEL_V1
+    from lab_uw.kinematic_velocity import result_fields
+    result_row.update(result_fields(simulation))
     return result_row
 
 
@@ -896,6 +943,11 @@ def _capture_local_continuation_state(
         "amplitude_scale_mode",
         "spectral_gamma",
         "objective_taper_fraction",
+        'kinematic_velocity_m_s',
+        'kinematic_arrival_us',
+        'kinematic_diagnostics',
+        '_kinematic_reference',
+        '_kinematic_cache',
     ):
         if hasattr(simulation, attribute_name):
             simulation_attributes[attribute_name] = deepcopy(
@@ -903,7 +955,7 @@ def _capture_local_continuation_state(
             )
 
     velocity_handler = simulation.velocity_model_handler
-    return {
+    return enrich_local_checkpoint({
         "assembly_dict": deepcopy(assembly_dict),
         "grid_spatial_axis": simulation.grid_handler.spatial_axis.copy(),
         "grid_total_grid_points": int(
@@ -921,7 +973,7 @@ def _capture_local_continuation_state(
             simulation.receiver_handler.spatial_function.copy()
         ),
         "simulation_attributes": simulation_attributes,
-    }
+    }, simulation)
 
 
 def _restore_local_continuation_state(
@@ -973,6 +1025,12 @@ def _run_local_inversion_chunk(
     continuation_state: Dict[str, Any] | None = None,
 ):
     """Invert a short consecutive part of one interlaced lane."""
+
+    # ADAPTIVE_INDEPENDENT_WORKERS_V1
+    from lab_uw.adaptive_independent import run_chunk, is_independent
+    if is_independent(_LOCAL_INVERSION_WORKER_CONTEXT["params"]):
+        return run_chunk(globals(), _LOCAL_INVERSION_WORKER_CONTEXT,
+                         row_positions, continuation_state)
 
     worker_pid = os.getpid()
     chunk_label = list(row_positions)
@@ -1554,6 +1612,12 @@ def _rebuild_simulation_from_saved_row(
 ) -> tuple[Dict[str, Any], UltrasonicModeler]:
     """Rebuild a lightweight modeler and inject a legacy saved model."""
 
+    if global_row.get("teeth_bank_metadata") is not None or global_row.get("teeth_continuous_metadata") is not None:
+        raise NotImplementedError(
+            "The saved P2-teeth result requires a multimodal local forward and adjoint; "
+            "its diagnostic profiles cannot initialize the legacy FD inversion."
+        )
+
     assembly = deepcopy(base_assembly)
     update_assembly_dict_with_mech_data(assembly, paired_row)
 
@@ -2028,7 +2092,7 @@ def _write_local_summary_plots(
     print(f"Saved: {out_g2}")
 
     out1 = pkl_path.with_name(
-        pkl_path.stem + "_shear_and_vavg_vs_time.png"
+        pkl_path.stem + "_shear_and_vkin_vs_time.png"
     )
     plot_shear_and_avg_velocity_from_pickle(pkl_path, out1)
     print(f"Saved: {out1}")
@@ -2060,6 +2124,10 @@ def process_uw_file(
       - mechanical metadata for later analysis/plotting
     """
 
+    _validate_elastic_search_configuration(params)
+    # ADAPTIVE_NOISE_REFERENCE_V1
+    from lab_uw.adaptive_sequence import prepare_params, enabled, resume_file, run_sequence, annotate_global, write_summary
+    params = prepare_params(params)
     outdir_path_l2norm = params["outdir_path_l2norm"]
     start_time = tm.time()
     outfile_name = infile_path.name.split(".")[0]
@@ -2075,6 +2143,30 @@ def process_uw_file(
         waveform_metadata=waveform_metadata,
         mechanical_dataframe=mechanical_dataframe,
     )
+    if restart_requested(params):
+        continue_saved_waveform(globals(), paired=paired,
+            observed_waveform_data=observed_waveform_data, waveform_metadata=waveform_metadata,
+            stf_handler=stf_handler, params=params, base_assembly=assembly_dict, infile_path=infile_path)
+        return
+    paired = select_mechanical_records(paired, mechanical_dataframe, params, infile_path)
+    if paired.empty:
+        return
+
+    # MECHANICAL_SELECTION_VISUAL_HOOK_V1
+    from lab_uw.mechanical_inspection import inspect_selected
+    if inspect_selected(globals(), paired=paired,
+            observed_waveform_data=observed_waveform_data, waveform_metadata=waveform_metadata,
+            stf_handler=stf_handler, params=params, assembly_dict=assembly_dict,
+            infile_path=infile_path):
+        return
+    # SUCCESSIVE_WAVES_PREINVERSION_V1
+    from lab_uw.wave_difference_preinversion import compare_selected
+    if compare_selected(globals(), paired=paired,
+                        observed_waveform_data=observed_waveform_data,
+                        waveform_metadata=waveform_metadata, stf_handler=stf_handler,
+                        params=params, assembly_dict=assembly_dict, infile_path=infile_path):
+        return
+
     paired_rows = list(paired.itertuples(index=False))
 
 
@@ -2086,6 +2178,14 @@ def process_uw_file(
     results_summary = []      # list of dicts for pandas
     results_by_rec_n = {}     # rec_n -> dict
 
+    if enabled(params) and results_pkl.exists() and results_pkl.stat().st_size:
+        if not params.get("resume_from_pickle", True):
+            raise ValueError("Adaptive results already exist: enable resume_from_pickle or use a new output folder.")
+        resume_file(globals(), results_pkl=results_pkl, paired_rows=paired_rows,
+                    observed_waveform_data=observed_waveform_data, waveform_metadata=waveform_metadata,
+                    outfile_name=outfile_name, params=params, assembly_dict=assembly_dict, stf_handler=stf_handler)
+        write_summary(globals(), results_pkl, params)
+        return
     if (
         params.get("resume_from_pickle", True)
         and params.get("run_local_inversion", True)
@@ -2097,6 +2197,14 @@ def process_uw_file(
             repair_incomplete_tail=True,
         )
         if existing_rows:
+            if params.get("elastic_material_search_enabled", False):
+                global_rows = [r for r in existing_rows if _is_global_result_row(r)]
+                if any(r.get("elastic_best_shape_misfit") is None for r in global_rows):
+                    raise ValueError(
+                        "The saved global search has no elastic comparison. "
+                        "Use a new output folder and resume_from_pickle=False "
+                        "to run the newly enabled search."
+                    )
             print(
                 f"resume: found {len(existing_rows)} complete rows in "
                 f"{results_pkl}",
@@ -2113,7 +2221,7 @@ def process_uw_file(
                 assembly_dict=assembly_dict,
                 stf_handler=stf_handler,
             )
-            _write_local_summary_plots(results_pkl, params)
+            write_summary(globals(), results_pkl, params)
             print(
                 f"--- {tm.time() - start_time:.2f} seconds for resuming "
                 f"{infile_path.name} ---"
@@ -2178,6 +2286,7 @@ def process_uw_file(
                 joint = result_global.get("joint_kinematic_result")
                 density = result_global.get("density_result")
                 impedance = result_global.get("impedance_material_result")
+                elastic = result_global.get("elastic_material_result")
                 post_impedance_thickness = result_global.get(
                     "post_impedance_thickness_result"
                 )
@@ -2219,6 +2328,10 @@ def process_uw_file(
                     "gouge_damping_list": result_global["gouge_damping_list"],
                     "best_gouge_damping": float(result_global["best_gouge_damping"]),
                     "L2norm_waveform_list": result_global["L2norm_waveform_list"],
+                    "complete_misfit_list": result_global["complete_misfit_list"],
+                    "homogeneous_spectral_distance_list": result_global["homogeneous_spectral_distance_list"],
+                    "homogeneous_spectral_diagnostics": result_global["homogeneous_spectral_diagnostics"],
+                    "global_spectral_gamma": result_global["global_spectral_gamma"],
 
                     # CONSTANT-TIME c1/c2 CONTRAST SEARCH (None when disabled)
                     "velocity_contrast_log_list": (
@@ -2358,64 +2471,78 @@ def process_uw_file(
                         else density["nominal_echo_factor_list"]
                     ),
                     "best_gouge_density_g_cm3": (
-                        None
-                        if density is None
-                        else density["best_gouge_density_g_cm3"]
+                        elastic["elastic_best_gouge_density_g_cm3"]
+                        if elastic is not None and impedance is None
+                        else (None if density is None else density["best_gouge_density_g_cm3"])
                     ),
                     "density_best_misfit": (
                         None if density is None else density["best_misfit"]
                     ),
 
+                    # ELASTIC c/density SEARCH: damping is exactly zero.
+                    "elastic_velocity_list": (
+                        None if elastic is None else elastic["coarse"]["gouge_velocity_list"]
+                    ),
+                    "elastic_damping_list": (
+                        None if elastic is None else elastic["coarse"]["gouge_damping_list"]
+                    ),
+                    "elastic_density_list_g_cm3": (
+                        None if elastic is None else elastic["coarse"]["gouge_density_list_g_cm3"]
+                    ),
+                    "elastic_shape_misfit_list": (
+                        None if elastic is None else elastic["coarse"]["waveform_shape_misfit_list"]
+                    ),
+                    "elastic_spectral_distance_list": (
+                        None if elastic is None else elastic["coarse"]["spectral_shape_distance_list"]
+                    ),
+                    "elastic_best_gouge_velocity": (
+                        None if elastic is None else elastic["elastic_best_gouge_velocity"]
+                    ),
+                    "elastic_best_gouge_damping": (
+                        None if elastic is None else elastic["elastic_best_gouge_damping"]
+                    ),
+                    "elastic_best_gouge_density_g_cm3": (
+                        None if elastic is None else elastic["elastic_best_gouge_density_g_cm3"]
+                    ),
+                    "elastic_best_shape_misfit": (
+                        None if elastic is None else elastic["best_waveform_shape_misfit"]
+                    ),
+                    "elastic_best_spectral_distance": (
+                        None if elastic is None else elastic["best_spectral_shape_distance"]
+                    ),
+                    "selected_material_model": result_global["selected_material_model"],
+                    "absorption_comparison": result_global["absorption_comparison"],
+
                     # JOINT c/damping/density IMPEDANCE SEARCH
-                    "impedance_coarse_velocity_list": (
+                    "impedance_velocity_list": (
                         None if impedance is None
                         else impedance["coarse"]["gouge_velocity_list"]
                     ),
-                    "impedance_coarse_damping_list": (
+                    "impedance_damping_list": (
                         None if impedance is None
                         else impedance["coarse"]["gouge_damping_list"]
                     ),
-                    "impedance_coarse_density_list_g_cm3": (
+                    "impedance_density_list_g_cm3": (
                         None if impedance is None
                         else impedance["coarse"]["gouge_density_list_g_cm3"]
                     ),
-                    "impedance_coarse_shape_misfit_list": (
+                    "impedance_shape_misfit_list": (
                         None if impedance is None
                         else impedance["coarse"]["waveform_shape_misfit_list"]
                     ),
-                    "impedance_coarse_spectral_distance_list": (
+                    "impedance_spectral_distance_list": (
                         None if impedance is None
                         else impedance["coarse"]["spectral_shape_distance_list"]
                     ),
-                    "impedance_fine_velocity_list": (
-                        None if impedance is None
-                        else impedance["fine"]["gouge_velocity_list"]
-                    ),
-                    "impedance_fine_damping_list": (
-                        None if impedance is None
-                        else impedance["fine"]["gouge_damping_list"]
-                    ),
-                    "impedance_fine_density_list_g_cm3": (
-                        None if impedance is None
-                        else impedance["fine"]["gouge_density_list_g_cm3"]
-                    ),
-                    "impedance_fine_shape_misfit_list": (
-                        None if impedance is None
-                        else impedance["fine"]["waveform_shape_misfit_list"]
-                    ),
-                    "impedance_fine_spectral_distance_list": (
-                        None if impedance is None
-                        else impedance["fine"]["spectral_shape_distance_list"]
-                    ),
                     "impedance_best_gouge_velocity": (
-                        None if impedance is None else impedance["best_gouge_velocity"]
+                        None if impedance is None else impedance["impedance_best_gouge_velocity"]
                     ),
                     "impedance_best_gouge_damping": (
-                        None if impedance is None else impedance["best_gouge_damping"]
+                        None if impedance is None else impedance["impedance_best_gouge_damping"]
                     ),
                     "impedance_best_gouge_density_g_cm3": (
                         None if impedance is None
-                        else impedance["best_gouge_density_g_cm3"]
+                        else impedance["impedance_best_gouge_density_g_cm3"]
                     ),
                     "impedance_best_shape_misfit": (
                         None if impedance is None
@@ -2498,8 +2625,20 @@ def process_uw_file(
                     "damping_profile": sim_g.velocity_model_handler.damping_array.copy() if hasattr(sim_g.velocity_model_handler, "damping_array") else None,
                     "density_profile": sim_g.velocity_model_handler.density_array.copy() if hasattr(sim_g.velocity_model_handler, "density_array") else None,
                 }
+                if result_global.get("teeth_bank_metadata") is not None:
+                    global_row["teeth_bank_metadata"] = result_global["teeth_bank_metadata"]
+                    global_row["teeth_bank_material_index_list"] = elastic["coarse"]["material_index_list"]
+                    global_row["teeth_bank_poisson_list"] = elastic["coarse"]["poisson_list"]
+                    global_row["teeth_bank_cp_m_s_list"] = elastic["coarse"]["cp_m_s_list"]
+                    global_row["teeth_bank_cs_m_s_list"] = elastic["coarse"]["cs_m_s_list"]
+                    global_row["diagnostic_profiles_only"] = True
+                if result_global.get("teeth_continuous_metadata") is not None:
+                    global_row["teeth_continuous_metadata"] = result_global["teeth_continuous_metadata"]
+                    global_row["teeth_candidate_index_list"] = elastic["coarse"]["material_index_list"]
+                    global_row["teeth_continuous_poisson_list"] = elastic["coarse"]["poisson_list"]
                 global_row["global_continuation_state"] = (
-                    _capture_local_continuation_state(assembly_dict, sim_g)
+                    None if result_global.get("teeth_bank_metadata") is not None
+                    else _capture_local_continuation_state(assembly_dict, sim_g)
                 )
                 global_row["local_anchor_stride"] = int(
                     params.get("local_anchor_stride", 10)
@@ -2508,6 +2647,7 @@ def process_uw_file(
                     params.get("local_records_per_worker", 3)
                 )
 
+                annotate_global(globals(), global_row, paired_rows, waveform_metadata, stf_handler, params, observed_waveform_data)
                 results_summary.append(global_row)
                 results_by_rec_n[rec_n] = global_row
                 pickle.dump(global_row, f_results, protocol=pickle.HIGHEST_PROTOCOL)
@@ -2516,6 +2656,13 @@ def process_uw_file(
             # -----------------------------
             # 2) LOCAL refine on subsequent waveforms
             # -----------------------------
+            if enabled(params):
+                run_sequence(globals(), paired_rows=paired_rows, start_position=row_position,
+                             observed_waveform_data=observed_waveform_data, waveform_metadata=waveform_metadata,
+                             outfile_name=outfile_name, params=params, assembly=assembly_dict,
+                             simulation=last_good_result["simulation_handler"], stf_handler=stf_handler, stream=f_results)
+                break
+            
             if not params.get("run_local_inversion", True):
                 continue
 
@@ -2591,7 +2738,7 @@ def process_uw_file(
                     f_results.flush()
                 break
 
-    _write_local_summary_plots(results_pkl, params)
+    write_summary(globals(), results_pkl, params)
     print(f"--- {tm.time() - start_time:.2f} seconds for processing {infile_path.name} ---")
 
 
@@ -3839,6 +3986,8 @@ def impedance_material_search_run(args) -> Dict[str, float]:
         params,
         assembly_dict,
         points_per_wavelength,
+        plot_output_path,
+        plot_name_prefix,
     ) = args
     candidate = _assembly_with_common_gouge_material(
         assembly_dict,
@@ -3873,8 +4022,11 @@ def impedance_material_search_run(args) -> Dict[str, float]:
         store_wavefield=False,
         source_receiver_config=params["source_receiver_config"],
         normalize_waveform=True,
-        enable_plotting=False,
+        enable_plotting=plot_output_path is not None,
         make_movie=False,
+        plot_output_path=plot_output_path,
+        plot_name_prefix=plot_name_prefix,
+        **_global_objective_options(params),
     )
     spectral = simulation.write_direct_arrival_spectral_diagnostics(
         output_directory=None,
@@ -3903,7 +4055,10 @@ def _evaluate_impedance_material_grid(
     assembly_dict: Dict[str, Any],
     points_per_wavelength: int,
     stage_name: str,
+    plot_output_path: Optional[Path] = None,
 ) -> list[Dict[str, float]]:
+    if plot_output_path is not None:
+        plot_output_path.mkdir(parents=True, exist_ok=True)
     args_list = [
         (
             velocity,
@@ -3916,8 +4071,10 @@ def _evaluate_impedance_material_grid(
             params,
             assembly_dict,
             points_per_wavelength,
+            plot_output_path,
+            f"candidate_{index:06d}_rho_{float(density):.8g}_".replace(".", ","),
         )
-        for velocity, damping, density in candidates
+        for index, (velocity, damping, density) in enumerate(candidates)
     ]
     num_processes = resolve_worker_count(
         params, "global_search_workers", len(args_list)
@@ -3987,15 +4144,22 @@ def _plot_profiled_material_results(
     metric_key: str,
     metric_label: str,
     output_path: Path,
+    elastic_only: bool = False,
 ) -> None:
     projections = (
         ("gouge_velocity", "gouge_density_g_cm3", r"$c_g$ [m/s]", r"$\rho_g$ [g/cm$^3$]"),
         ("gouge_damping", "gouge_density_g_cm3", r"$\nu_g$", r"$\rho_g$ [g/cm$^3$]"),
         ("gouge_velocity", "gouge_damping", r"$c_g$ [m/s]", r"$\nu_g$"),
     )
+    if elastic_only:
+        # Damping is fixed, so only the c/rho plane is a search dimension.
+        projections = projections[:1]
     best = min(results, key=lambda item: item[metric_key])
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), constrained_layout=True)
-    for axis, (x_key, y_key, x_label, y_label) in zip(axes, projections):
+    fig, axes = plt.subplots(
+        1, len(projections), figsize=(5 * len(projections), 4.5),
+        constrained_layout=True,
+    )
+    for axis, (x_key, y_key, x_label, y_label) in zip(np.atleast_1d(axes), projections):
         x_values, y_values, grid = _profiled_material_metric(
             results, x_key=x_key, y_key=y_key, metric_key=metric_key
         )
@@ -4009,7 +4173,8 @@ def _plot_profiled_material_results(
         axis.set_ylabel(y_label)
         axis.grid(alpha=0.15)
         fig.colorbar(image, ax=axis, label=metric_label)
-    fig.suptitle(f"Profiled joint material search: {metric_label}")
+    model_label = "Elastic material search (nu=0)" if elastic_only else "Profiled joint material search"
+    fig.suptitle(f"{model_label}: {metric_label}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
@@ -4044,111 +4209,90 @@ def search_joint_impedance_material(
     assembly_dict: Dict[str, Any],
     plot_output_path: Path,
     save_plot: bool,
+    material_model: str = "kelvin_voigt",
 ) -> Dict[str, Any]:
-    """Coarse then fine common-material search with the impedance forward."""
+    """Common-material grid with physical density and optional KV damping.
 
-    coarse_velocity = np.asarray(
-        params.get("impedance_coarse_velocity_values_cm_us", params["velocity_initial_list"]),
+    ``elastic`` fixes nu=0 everywhere. The same propagation kernel then
+    solves rho*u_tt = d_x(rho*c**2*u_x) + rho*f*s, with the same boundary,
+    source, receiver, direct window and trace-scale fitting conventions.
+    This file currently implements one grid stage, labelled ``coarse``.
+    """
+
+    if material_model not in {"kelvin_voigt", "elastic"}:
+        raise ValueError("material_model must be 'kelvin_voigt' or 'elastic'")
+    elastic_only = material_model == "elastic"
+
+    impedance_velocity = np.asarray(
+        params.get("impedance_velocity_values_cm_us", params["velocity_initial_list"]),
         dtype=float,
     )
-    coarse_damping = np.asarray(
-        params.get("impedance_coarse_damping_values", params["damping_initial_list"]),
+    if elastic_only:
+        impedance_damping = np.array([0.0])
+    else:
+        impedance_damping = np.asarray(
+            params.get("impedance_damping_values", params["damping_initial_list"]),
+            dtype=float,
+        )
+        if params.get("elastic_material_search_enabled", False):
+            # The compared KV family must contain the elastic family exactly.
+            impedance_damping = np.unique(np.append(impedance_damping, 0.0))
+    impedance_density = np.asarray(
+        params.get("impedance_density_values_g_cm3", np.linspace(1.8, 3.0, 7)),
         dtype=float,
     )
-    coarse_density = np.asarray(
-        params.get("impedance_coarse_density_values_g_cm3", np.linspace(1.8, 3.0, 7)),
-        dtype=float,
+    impedance_candidates = material_candidates(
+        impedance_velocity, impedance_damping, impedance_density
     )
-    coarse_candidates = material_candidates(
-        coarse_velocity, coarse_damping, coarse_density
-    )
-    coarse_ppw = int(params.get("impedance_coarse_points_per_wavelength", 4))
-    fine_ppw = int(params.get("impedance_fine_points_per_wavelength", 8))
-    if coarse_ppw < 2 or fine_ppw < 2:
+    impedance_ppw = int(params.get("impedance_points_per_wavelength", 8))
+    if impedance_ppw < 2 or impedance_ppw < 2:
         raise ValueError("impedance-search PPW values must be at least two")
 
-    output_dir = plot_output_path / "joint_impedance_material_search"
+    output_dir = plot_output_path / (
+        "elastic_material_search" if elastic_only else "joint_impedance_material_search"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
-    coarse_results = _evaluate_impedance_material_grid(
-        candidates=coarse_candidates,
+    impedance_results = _evaluate_impedance_material_grid(
+        candidates=impedance_candidates,
         observed_waveform=observed_waveform,
         observed_time=observed_time,
         stf_handler=stf_handler,
         misfit_interval=misfit_interval,
         params=params,
         assembly_dict=assembly_dict,
-        points_per_wavelength=coarse_ppw,
-        stage_name="coarse impedance search",
+        points_per_wavelength=impedance_ppw,
+        stage_name="elastic material search (nu=0)" if elastic_only else "coarse impedance search",
+        plot_output_path=output_dir / "all_forward" if save_plot else None,
     )
-    coarse_best = min(coarse_results, key=lambda item: item["waveform_shape_misfit"])
+    impedance_best = min(impedance_results, key=lambda item: item["waveform_shape_misfit"])
 
-    velocity_bounds = _parameter_bounds(
-        params, "impedance_velocity_bounds_cm_us", default_lower=1.0e-9, default_upper=None
-    )
-    damping_bounds = _parameter_bounds(
-        params, "impedance_damping_bounds", default_lower=0.0, default_upper=None
-    )
-    density_bounds = _parameter_bounds(
-        params, "impedance_density_bounds_g_cm3", default_lower=1.5, default_upper=3.1
-    )
-    fine_count = int(params.get("impedance_fine_points_per_axis", 7))
-    fine_velocity = centered_refined_axis(
-        coarse_best["gouge_velocity"], coarse_velocity,
-        number_of_points=fine_count,
-        half_width=params.get("impedance_fine_velocity_half_width_cm_us"),
-        lower_bound=velocity_bounds[0], upper_bound=velocity_bounds[1],
-    )
-    fine_damping = centered_refined_axis(
-        coarse_best["gouge_damping"], coarse_damping,
-        number_of_points=fine_count,
-        half_width=params.get("impedance_fine_damping_half_width"),
-        lower_bound=damping_bounds[0], upper_bound=damping_bounds[1],
-    )
-    fine_density = centered_refined_axis(
-        coarse_best["gouge_density_g_cm3"], coarse_density,
-        number_of_points=fine_count,
-        half_width=params.get("impedance_fine_density_half_width_g_cm3"),
-        lower_bound=density_bounds[0], upper_bound=density_bounds[1],
-    )
-    fine_candidates = material_candidates(fine_velocity, fine_damping, fine_density)
-    fine_results = _evaluate_impedance_material_grid(
-        candidates=fine_candidates,
-        observed_waveform=observed_waveform,
-        observed_time=observed_time,
-        stf_handler=stf_handler,
-        misfit_interval=misfit_interval,
-        params=params,
-        assembly_dict=assembly_dict,
-        points_per_wavelength=fine_ppw,
-        stage_name="fine impedance search",
-    )
-    fine_best = min(fine_results, key=lambda item: item["waveform_shape_misfit"])
 
-    for stage, results in (("coarse", coarse_results), ("fine", fine_results)):
-        _plot_profiled_material_results(
-            results,
-            metric_key="waveform_shape_misfit",
-            metric_label=r"$J_{shape}$",
-            output_path=output_dir / f"{stage}_waveform_shape_misfit.png",
-        )
-        _plot_profiled_material_results(
-            results,
-            metric_key="spectral_shape_distance",
-            metric_label=r"$D_f$",
-            output_path=output_dir / f"{stage}_spectral_shape_distance.png",
-        )
+    results = impedance_results
+    _plot_profiled_material_results(
+        results,
+        metric_key="waveform_shape_misfit",
+        metric_label=rf"$J_\gamma$ ($\gamma={_global_objective_options(params)['spectral_gamma']:g}$)",
+        output_path=output_dir / "complete_misfit.png",
+        elastic_only=elastic_only,
+    )
+    _plot_profiled_material_results(
+        results,
+        metric_key="spectral_shape_distance",
+        metric_label=r"$D_f$",
+        output_path=output_dir / "spectral_shape_distance.png",
+        elastic_only=elastic_only,
+    )
 
     best_assembly = _assembly_with_common_gouge_material(
         assembly_dict,
         params,
-        gouge_velocity=fine_best["gouge_velocity"],
-        gouge_damping=fine_best["gouge_damping"],
-        gouge_density=fine_best["gouge_density_g_cm3"],
+        gouge_velocity=impedance_best["gouge_velocity"],
+        gouge_damping=impedance_best["gouge_damping"],
+        gouge_density=impedance_best["gouge_density_g_cm3"],
     )
     assembly_dict.update(best_assembly)
     minimum_velocity, maximum_velocity = _simulation_velocity_limits(params, assembly_dict)
-    best_output = output_dir / "best_fine_model"
-    best_output.mkdir(parents=True, exist_ok=True)
+    best_output = output_dir
     best_simulation = UltrasonicModeler()
     best_simulation.forward_simulation(
         absorbing=params["absorbing"],
@@ -4162,43 +4306,40 @@ def search_joint_impedance_material(
         normalization_interval=misfit_interval,
         minimum_velocity=minimum_velocity,
         maximum_velocity=maximum_velocity,
-        maximum_damping=float(fine_best["gouge_damping"]),
+        maximum_damping=float(impedance_best["gouge_damping"]),
         embedding_mode=params["embedding_mode"],
         boundary_condition=params["boundary_condition"],
         source_injection=params["source_injection"],
         receiver_quantity=params["receiver_quantity"],
-        points_per_wavelength=fine_ppw,
+        points_per_wavelength=impedance_ppw,
         store_wavefield=False,
         source_receiver_config=params["source_receiver_config"],
         normalize_waveform=True,
         enable_plotting=save_plot,
         make_movie=False,
         plot_output_path=best_output,
+        plot_name_prefix="best_elastic_fit_" if elastic_only else "best_impedance_fit_",
+        **_global_objective_options(params),
     )
-    best_spectral = best_simulation.write_direct_arrival_spectral_diagnostics(
-        output_directory=None,
-        frequency_min_mhz=float(params.get("frequency_min", 0.0)),
-        frequency_max_mhz=float(params["frequency_cutoff"]),
-    )
+    best_spectral = _write_global_best_spectra(best_simulation, params, output_dir, save_plot)
     print(
-        "joint impedance material minimum (selected only by J_shape): "
-        f"c_g={1.0e4 * fine_best['gouge_velocity']:.0f} m/s, "
-        f"damping={fine_best['gouge_damping']:.6f}, "
-        f"rho_g={fine_best['gouge_density_g_cm3']:.3f} g/cm^3, "
-        f"J_shape={best_simulation.misfit:.3f}, "
+        f"{material_model} material minimum (selected only by J_gamma): "
+        f"c_g={1.0e4 * impedance_best['gouge_velocity']:.0f} m/s, "
+        f"damping={impedance_best['gouge_damping']:.6f}, "
+        f"rho_g={impedance_best['gouge_density_g_cm3']:.3f} g/cm^3, "
+        f"J_gamma={best_simulation.misfit:.3f}, "
         f"D_f={best_spectral['recorded_vs_simulated_distance']:.4f}"
     )
     return {
-        "coarse": _material_result_arrays(coarse_results),
-        "fine": _material_result_arrays(fine_results),
-        "coarse_best_gouge_velocity": float(coarse_best["gouge_velocity"]),
-        "coarse_best_gouge_damping": float(coarse_best["gouge_damping"]),
-        "coarse_best_gouge_density_g_cm3": float(coarse_best["gouge_density_g_cm3"]),
-        "coarse_best_waveform_shape_misfit": float(coarse_best["waveform_shape_misfit"]),
-        "coarse_best_spectral_shape_distance": float(coarse_best["spectral_shape_distance"]),
-        "best_gouge_velocity": float(fine_best["gouge_velocity"]),
-        "best_gouge_damping": float(fine_best["gouge_damping"]),
-        "best_gouge_density_g_cm3": float(fine_best["gouge_density_g_cm3"]),
+        "material_model": material_model,
+        "spectral_gamma": best_simulation.spectral_gamma,
+        "best_spectral_diagnostics": best_spectral,
+        "coarse": _material_result_arrays(impedance_results),
+        "impedance_best_gouge_velocity": float(impedance_best["gouge_velocity"]),
+        "impedance_best_gouge_damping": float(impedance_best["gouge_damping"]),
+        "impedance_best_gouge_density_g_cm3": float(impedance_best["gouge_density_g_cm3"]),
+        "impedance_best_waveform_shape_misfit": float(impedance_best["waveform_shape_misfit"]),
+        "impedance_best_spectral_shape_distance": float(impedance_best["spectral_shape_distance"]),
         "best_waveform_shape_misfit": float(best_simulation.misfit),
         "best_spectral_shape_distance": float(
             best_spectral["recorded_vs_simulated_distance"]
@@ -4206,6 +4347,72 @@ def search_joint_impedance_material(
         "selection_metric": "waveform_shape_misfit",
         "simulation_handler": best_simulation,
     }
+
+
+def search_elastic_material(**kwargs) -> Dict[str, Any]:
+    """Search c_g/rho_g with nu=0, using the physical-impedance workflow."""
+    result = search_joint_impedance_material(**kwargs, material_model="elastic")
+    return {
+        key.replace("impedance_best_", "elastic_best_", 1): value
+        for key, value in result.items()
+    }
+
+
+def _validate_elastic_search_configuration(params: Dict[str, Any]) -> None:
+    if params.get("teeth_bank_enabled", False) or params.get("teeth_continuous_enabled", False):
+        from lab_uw.teeth_bank_search import validate_configuration
+        validate_configuration(params)
+        return
+    if (
+        params.get("elastic_material_search_enabled", False)
+        and not params.get("impedance_material_search_enabled", False)
+        and params.get("run_local_inversion", True)
+    ):
+        raise ValueError(
+            "An elastic-only global search requires run_local_inversion=False: "
+            "the existing local inversion also updates Kelvin-Voigt damping. "
+            "Enable impedance_material_search_enabled to continue from the KV model."
+        )
+
+
+def _compare_elastic_kelvin_voigt(
+    elastic_result: Dict[str, Any],
+    kv_result: Dict[str, Any],
+    *,
+    output_path: Path,
+    save_plot: bool,
+) -> Dict[str, float]:
+    """Report grid minima and optionally overlay the two fitted direct traces."""
+    elastic_sim = elastic_result["simulation_handler"]
+    kv_sim = kv_result["simulation_handler"]
+    comparison = {
+        "elastic_best_shape_misfit": float(elastic_sim.misfit),
+        "kelvin_voigt_best_shape_misfit": float(kv_sim.misfit),
+        "shape_misfit_reduction": float(elastic_sim.misfit - kv_sim.misfit),
+        "elastic_best_spectral_distance": float(elastic_result["best_spectral_shape_distance"]),
+        "kelvin_voigt_best_spectral_distance": float(kv_result["best_spectral_shape_distance"]),
+    }
+    print(
+        "elastic / Kelvin-Voigt grid comparison: "
+        f"J_elastic={elastic_sim.misfit:.6g}, J_KV={kv_sim.misfit:.6g}, "
+        f"reduction={comparison['shape_misfit_reduction']:.6g}"
+    )
+    if save_plot:
+        mask = sample_interval_mask(elastic_sim.misfit_interval, elastic_sim.observed_time.size)
+        time = elastic_sim.observed_time[mask]
+        fig, axis = plt.subplots(figsize=(10, 5), constrained_layout=True)
+        axis.plot(time, elastic_sim.observed_waveform[mask], color="black", label="Recorded")
+        axis.plot(time, elastic_sim.synthetic_waveform[mask], label=f"Elastic, nu=0: J={elastic_sim.misfit:.4g}")
+        axis.plot(time, kv_sim.synthetic_waveform[mask], label=f"Kelvin-Voigt: J={kv_sim.misfit:.4g}")
+        axis.set_xlabel("Time [us]")
+        axis.set_ylabel("Amplitude (fitted trace scale)")
+        axis.set_title("Best homogeneous physical-density models: direct arrival")
+        axis.grid(alpha=0.2)
+        axis.legend()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=200)
+        plt.close(fig)
+    return comparison
 
 
 def global_search_homogeneus(
@@ -4217,6 +4424,22 @@ def global_search_homogeneus(
     assembly_dict: Dict[str,Any],
 ) -> Dict[str, Union[float, np.ndarray, None]]:
 
+    _validate_elastic_search_configuration(params)
+    if params.get("teeth_continuous_enabled", False):
+        from lab_uw.teeth_continuous_search import search_continuous_global
+        from types import SimpleNamespace
+        workflow = SimpleNamespace(
+            evaluate_snr=evaluate_snr,
+            predict_event_windows=predict_event_windows,
+            direct_misfit_interval=direct_misfit_interval,
+            resolve_worker_count=resolve_worker_count,
+        )
+        return search_continuous_global(observed_waveform, waveform_metadata, outfile_name,
+                                        stf_handler, params, assembly_dict, workflow=workflow)
+    if params.get("teeth_bank_enabled", False):
+        from lab_uw.teeth_bank_search import search_bank_global
+        return search_bank_global(observed_waveform, waveform_metadata, outfile_name,
+                                  stf_handler, params, assembly_dict)
     # Unpack needed dictionaries entries
     observed_time          = waveform_metadata['time_ax_waveform']         # time axes for the samples of a single waveform acquisition
     frequency_cutoff       = params['frequency_cutoff']
@@ -4241,6 +4464,7 @@ def global_search_homogeneus(
     impedance_material_enabled = bool(
         params.get("impedance_material_search_enabled", False)
     )
+    elastic_material_enabled = bool(params.get("elastic_material_search_enabled", False))
     post_impedance_thickness_enabled = bool(
         params.get("post_impedance_thickness_search_enabled", False)
     )
@@ -4354,30 +4578,14 @@ def global_search_homogeneus(
     misfit_interval_list = np.array([res[2] for res in results_sorted])
     gouge_damping_list   = np.array([res[3] for res in results_sorted])
 
-    # Possibly plot L2 norm vs. velocity
+    # Two separate maps: complete objective used for selection, and the
+    # spectral diagnostic alone. Keep legacy pickle keys for old readers.
+    homogeneous_spectral_distance_list = np.array([res[4] for res in results_sorted])
     if l2norm_plot:
-        unique_vels = np.unique(gouge_velocity_list)
-        unique_damps = np.unique(gouge_damping_list)
-        misfit_grid = np.full((len(unique_vels), len(unique_damps)), np.nan)
-
-        vel_to_row = {vel: idx for idx, vel in enumerate(unique_vels)}
-        damp_to_col = {damp: idx for idx, damp in enumerate(unique_damps)}
-
-        for (v, misfit, _, a) in results_sorted:
-            row = vel_to_row[v]
-            col = damp_to_col[a]
-            misfit_grid[row, col] = misfit
-
-        l2norm_plot_name = f"{outfile_name}_L2norm"
-        plot_output_dir = plot_output_global
-        l2norm_plot_path = plot_output_dir / l2norm_plot_name
-
-        plotter = Plotter()
-        plotter.misfit_map(
-            misfit_grid=misfit_grid,
-            unique_damps=unique_damps,
-            unique_vels=unique_vels,
-            outfile_path=l2norm_plot_path
+        _plot_homogeneous_search_maps(
+            results_sorted,
+            plot_output_global,
+            spectral_gamma=_global_objective_options(params)["spectral_gamma"],
         )
 
     #####################################################
@@ -4440,6 +4648,7 @@ def global_search_homogeneus(
                                       or joint_kinematic_enabled
                                       or density_search_enabled
                                       or impedance_material_enabled
+                                      or elastic_material_enabled
                                       or post_impedance_thickness_enabled
                                   ),
         source_receiver_config  = params["source_receiver_config"],
@@ -4448,16 +4657,22 @@ def global_search_homogeneus(
         make_movie              = False,
         plot_output_path        = plot_output_global,
         plot_name_prefix        = "best_homogeneus_fit_",
-        movie_output_path       = movie_output_path
+        movie_output_path       = movie_output_path,
+        **_global_objective_options(params),
     )
 
     homogeneous_best_misfit = float(simulation.misfit)
+    homogeneous_spectral_result = _write_global_best_spectra(
+        simulation, params, plot_output_global, save_plot
+    )
     homogeneous_assembly = deepcopy(assembly_dict)
     contrast_result = None
     thickness_result = None
     joint_result = None
     density_result = None
     impedance_material_result = None
+    elastic_material_result = None
+    absorption_comparison = None
     post_impedance_thickness_result = None
 
     # The one-dimensional stages are independent diagnostics around exactly
@@ -4543,6 +4758,24 @@ def global_search_homogeneus(
         )
         simulation = density_result["simulation_handler"]
 
+    # Both material searches start from the same geometry.  A diagnostic
+    # elastic fit must not alter the input assembly of the compared KV fit.
+    if elastic_material_enabled:
+        elastic_assembly = deepcopy(assembly_dict)
+        elastic_material_result = search_elastic_material(
+            observed_waveform=observed_waveform,
+            observed_time=observed_time,
+            stf_handler=stf_handler,
+            misfit_interval=misfit_interval,
+            params=params,
+            assembly_dict=elastic_assembly,
+            plot_output_path=plot_output_path,
+            save_plot=save_plot,
+        )
+        if not impedance_material_enabled:
+            assembly_dict.update(elastic_assembly)
+            simulation = elastic_material_result["simulation_handler"]
+
     if impedance_material_enabled:
         impedance_material_result = search_joint_impedance_material(
             observed_waveform=observed_waveform,
@@ -4555,6 +4788,13 @@ def global_search_homogeneus(
             save_plot=save_plot,
         )
         simulation = impedance_material_result["simulation_handler"]
+        if elastic_material_result is not None:
+            absorption_comparison = _compare_elastic_kelvin_voigt(
+                elastic_material_result,
+                impedance_material_result,
+                output_path=plot_output_path / "elastic_vs_kelvin_voigt.png",
+                save_plot=save_plot,
+            )
 
     if post_impedance_thickness_enabled:
         post_impedance_thickness_result = search_constant_total_gouge_thickness(
@@ -4565,10 +4805,10 @@ def global_search_homogeneus(
             params=params,
             assembly_dict=assembly_dict,
             fixed_velocity=float(
-                impedance_material_result["best_gouge_velocity"]
+                impedance_material_result["impedance_best_gouge_velocity"]
             ),
             fixed_damping=float(
-                impedance_material_result["best_gouge_damping"]
+                impedance_material_result["impedance_best_gouge_damping"]
             ),
             plot_output_path=plot_output_path,
             save_plot=save_plot,
@@ -4579,7 +4819,7 @@ def global_search_homogeneus(
     spectral_result = None
     if params.get("spectral_diagnostics_enabled", True):
         spectral_result = simulation.write_direct_arrival_spectral_diagnostics(
-            output_directory=plot_output_path / "spectral_diagnostics",
+            output_directory=None,
             frequency_min_mhz=float(params.get("frequency_min", 0.0)),
             frequency_max_mhz=float(params["frequency_cutoff"]),
         )
@@ -4595,14 +4835,17 @@ def global_search_homogeneus(
     best_thickness_1 = float(assembly_dict["gouge_thickness_1"])
     best_thickness_2 = float(assembly_dict["gouge_thickness_2"])
     selected_common_velocity = (
-        float(impedance_material_result["best_gouge_velocity"])
+        float(impedance_material_result["impedance_best_gouge_velocity"])
         if impedance_material_result is not None
-        else float(best_gouge_velocity)
+        else (
+            float(elastic_material_result["elastic_best_gouge_velocity"])
+            if elastic_material_result is not None else float(best_gouge_velocity)
+        )
     )
     selected_common_damping = (
-        float(impedance_material_result["best_gouge_damping"])
+        float(impedance_material_result["impedance_best_gouge_damping"])
         if impedance_material_result is not None
-        else float(best_gouge_damping)
+        else (0.0 if elastic_material_result is not None else float(best_gouge_damping))
     )
 
     output = {
@@ -4618,12 +4861,22 @@ def global_search_homogeneus(
         'gouge_damping_list'  : gouge_damping_list,
         'best_gouge_damping'  : selected_common_damping,
         'L2norm_waveform_list': L2norm_waveform_list,
+        'complete_misfit_list': L2norm_waveform_list,
+        'homogeneous_spectral_distance_list': homogeneous_spectral_distance_list,
+        'homogeneous_spectral_diagnostics': homogeneous_spectral_result,
+        'global_spectral_gamma': _global_objective_options(params)["spectral_gamma"],
         'homogeneous_best_misfit': homogeneous_best_misfit,
         'velocity_contrast_result': contrast_result,
         'gouge_thickness_result': thickness_result,
         'joint_kinematic_result': joint_result,
         'density_result': density_result,
         'impedance_material_result': impedance_material_result,
+        'elastic_material_result': elastic_material_result,
+        'absorption_comparison': absorption_comparison,
+        'selected_material_model': (
+            'kelvin_voigt' if impedance_material_result is not None
+            else ('elastic' if elastic_material_result is not None else 'legacy')
+        ),
         'post_impedance_thickness_result': post_impedance_thickness_result,
         'spectral_diagnostics': spectral_result,
         'spectral_shape_distance': (
@@ -4632,11 +4885,12 @@ def global_search_homogeneus(
             else spectral_result['recorded_vs_simulated_distance']
         ),
         'best_gouge_density_g_cm3': (
-            impedance_material_result['best_gouge_density_g_cm3']
+            impedance_material_result['impedance_best_gouge_density_g_cm3']
             if impedance_material_result is not None
             else (
-                None if density_result is None
-                else density_result['best_gouge_density_g_cm3']
+                elastic_material_result['elastic_best_gouge_density_g_cm3']
+                if elastic_material_result is not None
+                else (None if density_result is None else density_result['best_gouge_density_g_cm3'])
             )
         ),
         "simulation_handler": simulation
@@ -4664,6 +4918,8 @@ def global_search_run(args):
     maximum_damping  = max(assembly_dict_guessed["gouge_damping_1"],assembly_dict_guessed["gouge_damping_2"])
 
     # Call DDS_UW_simulation with gouge_velocity_tuple
+    all_forward_path = Path(plot_output_global) / "all_forward"
+    all_forward_path.mkdir(parents=True, exist_ok=True)
     simulation = UltrasonicModeler()
     simulation.forward_simulation(
         absorbing               = params["absorbing"],
@@ -4686,7 +4942,8 @@ def global_search_run(args):
         source_receiver_config  = params["source_receiver_config"],
         normalize_waveform      = True,
         enable_plotting         = True,
-        plot_output_path        = plot_output_global
+        plot_output_path        = all_forward_path,
+        **_global_objective_options(params),
     )
     
     L2norm_new = simulation.misfit
@@ -4695,7 +4952,11 @@ def global_search_run(args):
     # theo_arrival_time = observed_time[misfit_interval][0]
     # print(f"\tVelocity: {1e4*gouge_velocity:.0f}, damping:{gouge_damping:.5f}, Theo arrival time: {theo_arrival_time:.2f} => Misfit: {L2norm_new:.1f}")
 
-    return gouge_velocity, L2norm_new, misfit_interval, gouge_damping
+    spectral = _write_global_best_spectra(simulation, params, None, False)
+    return (
+        gouge_velocity, L2norm_new, misfit_interval, gouge_damping,
+        float(spectral["recorded_vs_simulated_distance"]),
+    )
 
 def local_refine_waveform(
     outfile_name: str,
@@ -4780,6 +5041,14 @@ def local_refine_waveform(
         params.get("local_damping_step_threshold_fraction", 0.01)
     ) * da_max_start
 
+    from lab_uw.adaptive_sequence import configure_local_stopping
+    configure_local_stopping(simulation, params)
+    scientific_limits = params.get("_adaptive_resume_limits")
+    if scientific_limits is not None:
+        dc_max_start = float(scientific_limits["dc_max_start"])
+        da_max_start = float(scientific_limits["da_max_start"])
+        dc_threshold = float(scientific_limits["dc_threshold"])
+        da_threshold = float(scientific_limits["da_threshold"])
     simulation.run_local_inversion(
         n_iterations         = params["n_iterations"],
         dc_max_start         = dc_max_start,
@@ -4817,7 +5086,7 @@ def local_refine_waveform(
     local_spectral_result = None
     if params.get("local_spectral_diagnostics_enabled", True):
         spectral_output_directory = (
-            record_output_path / "local_spectral_diagnostics"
+            local_output_path
             if record_output_path is not None
             else None
         )
@@ -4872,10 +5141,62 @@ if __name__ == "__main__":
     machine_name    = "big_biax"
     experiment_name = "r0072suw03anhdol_6035"
     wave_type       = "_s"    # that "_" is ugly, but needed
+
+    # ORCHESTRATION_PS_MECHANICAL_SELECTION_V1
+    # Modifica wave_type sopra; le impostazioni indipendenti sono raccolte qui.
+    polarization_settings = {
+        '_s': {
+            'velocity_values_cm_us': np.linspace(0.1100, 0.1500, 16),
+            'impedance_velocity_values_cm_us': np.linspace(0.1100, 0.1500, 16),
+            'damping_values_cm2_us': np.linspace(0.000,0.0005, 20),
+            'impedance_damping_values_cm2_us': np.linspace(0.000,0.0005, 20),
+            'minimum_velocity_cm_us': 0.08,
+            'maximum_velocity_cm_us': 0.33,
+            'waveform_duration_us': 25,
+            'frequency_min_mhz': 0.1,
+            'frequency_cutoff_mhz': 6,
+            'stf_machine': "on_bench",
+            'stf_experiment': "STF_pfake500_s250_multichannel",
+            'stf_h5_path': None,  # oppure un percorso HDF5 esplicito
+            'stf_name': 's_70V_100nm',
+            'stf_cycle_index': 0,
+            'stf_truncate_us': 4,
+            'uw_basename': '006_reload_ss_1_S',  # None: tutti i file
+        },
+        '_p': {
+            'velocity_values_cm_us': np.linspace(0.1600, 0.2000, 20),
+            'impedance_velocity_values_cm_us': np.linspace(0.1600, 0.2000, 20),
+            'damping_values_cm2_us': np.linspace(0.0005, 0.0009, 20),
+            'impedance_damping_values_cm2_us': np.linspace(0.0005, 0.0009, 20),
+            'minimum_velocity_cm_us': 0.15,
+            'maximum_velocity_cm_us': 0.62,
+            'waveform_duration_us': 16,
+            'frequency_min_mhz': 0.1,
+            'frequency_cutoff_mhz': 6,
+            'stf_machine': "on_bench",
+            'stf_experiment': "STF_pfake500_s250_multichannel",
+            'stf_h5_path': None,  # oppure un percorso HDF5 esplicito
+            'stf_name': 'p_70V_100nm',
+            'stf_cycle_index': 0,
+            'stf_truncate_us': 4,
+            'uw_basename': '005_reload_ss_1_P',  # None: tutti i file
+        },
+    }
+    polarization = validate_polarization(wave_type, polarization_settings)
+    selected_uw_basename = polarization['uw_basename']
+    mechanical_selection = {
+        'enabled': True,
+        'time_interval_s': None,  # None: scegli sul grafico la prima volta
+        'reselect': False,  # True: scegli nuovamente il tratto
+        'selection_file': (dir_manager.paths.analysis_root(machine_name, experiment_name)
+                           / 'inversion_mechanical_interval.json'),
+        'experiment_key': f'{machine_name}:{experiment_name}',
+    }
+
     data_type_uw    = "uw_data/data_tsv_files" + wave_type
     data_type_mech  = "mechanical_data"
     mech_file_name  = f"{experiment_name}_data_rp"
-    outfolder_name  = "test_2026-10-08_s"
+    outfolder_name  = "test_2026-10-16_gamma0_gamma1_joint_p_6MHz_adaptive_noise_SNR_3_charge_and_3_ss_last"
     # Create output directories
     outdir_path_l2norm = dir_manager.make_data_analysis_folders(
         machine_name    = machine_name,
@@ -4898,7 +5219,7 @@ if __name__ == "__main__":
         "receiver_quantity"         : "velocity",
         # Keep the broad homogeneous search cheap; the small diagnostic
         # thickness search can use a finer grid in receiver-only mode.
-        "points_per_wavelength"     : 4,
+        "points_per_wavelength"     : 8,
         "source_receiver_config"    : {
             "interpolation_radius_cells": 4,
             "source_extension_cm": 0.0,
@@ -4907,7 +5228,7 @@ if __name__ == "__main__":
             "receiver_normalization": "sum",
             "spatial_boundary_mode": "truncate",
         },
-        "frequency_min"             : 0.1,
+        "frequency_min"             : polarization['frequency_min_mhz'],
         "direct_window_padding_us"  : 0.25,
         "diagnostic_plot_only"      : False,
         # The earlier kinematic diagnostics remain available, but are silent
@@ -4916,7 +5237,7 @@ if __name__ == "__main__":
         "velocity_contrast_search_enabled": False,
         "velocity_contrast_points_per_wavelength": 8,
         "velocity_contrast_log_values": np.linspace(-0.10, 0.10, 11),
-        "velocity_contrast_plot_all": True,
+        "velocity_contrast_plot_all": False,
         "gouge_thickness_search_enabled": False,
         "gouge_thickness_points_per_wavelength": 8,
         "gouge_thickness_offset_mm_values": np.linspace(-0.2, 0.2, 40),
@@ -4938,21 +5259,62 @@ if __name__ == "__main__":
         # 1) the historical rho-normalised homogeneous c/damping grid above is
         #    retained as a baseline;
         # 2) coarse physical-impedance grid at 4 PPW;
-        # 3) local Cartesian refinement around its minimum at 8 PPW;
-        # 4) J_shape and D_f are stored separately, and only J_shape selects
-        #    the model at this stage.
+        # 3) J_gamma and D_f are stored separately, and only J_gamma selects
+        #    the model at this stage (with the configured global gamma).
         "impedance_material_search_enabled": True,
-        "impedance_coarse_points_per_wavelength": 4,
-        "impedance_coarse_velocity_values_cm_us": np.linspace(0.1200, 0.1700, 10),
-        "impedance_coarse_damping_values": np.linspace(0.0000, 0.0005, 5),
-        "impedance_coarse_density_values_g_cm3": np.linspace(1.6, 2.9, 13),
-        "impedance_fine_points_per_wavelength": 4,
-        "impedance_fine_points_per_axis": 7,
-        "impedance_density_bounds_g_cm3": (1.5, 3.1),
+        # Additional elastic c/rho grid, with nu fixed to zero everywhere.
+        # Reuses the impedance velocity/density arrays and PPW below.
+        # With both searches enabled, save their comparison and continue
+        # locally from the KV model. For elastic-only global runs, also set
+        # impedance_material_search_enabled=False and run_local_inversion=False.
+        "elastic_material_search_enabled": False,
+        # Bank-only global search: exact 5 x 10 x 4 material grid, no new FEM.
+        # Extract all original matrix archives into this directory, or set
+        # LAB_UW_TEETH_BANK to an absolute matrices/ path before launching.
+        "teeth_bank_enabled": False,
+        "teeth_bank": {
+            "directory": os.environ.get("LAB_UW_TEETH_BANK", str(
+                Path(__file__).resolve().parents[1] / "teeth_parameter_sweep" / "matrices")),
+            "frequency_interpolation": "linear",
+            "fft_padding_factor": 8,
+            "periodic_tail_factor": 1e-4,
+            "time_oversampling": 1,
+            "lateral_offsets_mm": [0., 0., 0., 0.],
+            "use_bank_metal_properties": True,
+        },
+        # Continuous material operator. Velocity is cS for _s, cP for _p.
+        # Poisson and the FD-unit bulk damping are distinct parameters.
+        "teeth_continuous_enabled": False,
+        "teeth_continuous": {
+            "model_directory": os.environ.get("LAB_UW_TEETH_CONTINUOUS"),
+            "backend": "reduced",
+            "density_values_g_cm3": np.linspace(1.5, 3.0, 5),
+            "velocity_values_cm_us": (np.linspace(0.1100, 0.1600, 11) if wave_type=="_s"
+                                      else np.linspace(0.2000, 0.2800, 11)),
+            "poisson_values": [0.15, 0.20, 0.30],
+            "bulk_damping_values_cm2_us": np.linspace(0.0000, 0.0009, 10),
+            "bulk_damping_law": "constant_poisson_kelvin_voigt",
+            "frequency_evaluation": "cubic",
+            "frequency_step_mhz": 0.025,
+            "fft_padding_factor": 8,
+            "periodic_tail_factor": 1e-4,
+            "time_oversampling": 1,
+            "lateral_offsets_mm": [0., 0., 0., 0.],
+            "use_bank_metal_properties": True,
+            "workers": 5,
+            "blas_threads": 1,
+            "cache_materials": 1,
+            "full_refinement_top_k": 3,
+            "plot_all_candidates": True,
+        },
+        "impedance_points_per_wavelength": 8,
+        "impedance_velocity_values_cm_us": polarization['impedance_velocity_values_cm_us'],
+        "impedance_damping_values": polarization['impedance_damping_values_cm2_us'],
+        "impedance_density_values_g_cm3": np.linspace(1.8, 2.5, 20),
         # Once the common material is fixed, redistribute only the measured
         # total gouge thickness.  With c1=c2 this cannot alter the direct
         # travel time; it tests only the relative timing of internal echoes.
-        "post_impedance_thickness_search_enabled": True,
+        "post_impedance_thickness_search_enabled": False,
         "spectral_diagnostics_enabled": True,
         "parallel_cpu_reserve": 1,
         "global_search_workers": 10,
@@ -4960,9 +5322,9 @@ if __name__ == "__main__":
         # record k starts from the accepted model at k-3 in its chain.  A
         # worker lives for at most three records, then a fresh process resumes
         # from the compact accepted-model checkpoint of the preceding chunk.
-        "local_inversion_workers": 3,
-        "local_anchor_stride": 3,
-        "local_records_per_worker": 3,
+        "local_inversion_workers": 10,
+        "local_anchor_stride": 10,
+        "local_records_per_worker": 1,
         # Reuse the append-only result stream after an interruption. Legacy
         # pickles without explicit checkpoints are reconstructed from their
         # saved profiles; new rows contain an exact compact continuation state.
@@ -4979,34 +5341,38 @@ if __name__ == "__main__":
         # The final global trace scale is calibrated once on the first record
         # and then held fixed.  gamma=1 is exactly the relative L2 objective;
         # larger values explicitly upweight spectral-energy shape.
-        "local_spectral_gamma": 2.0,
+        "local_spectral_gamma": 1.0,
+        # All three global grids use the same complete J_gamma objective.
+        # Omit these keys to inherit the corresponding local settings.
+        "global_spectral_gamma": 0.0,
+        "global_objective_taper_fraction": 0.0,
         "local_objective_taper_fraction": 0.0,
-        "local_misfit_threshold": 1.0e-8,
+        "local_misfit_threshold": 1.0e-2,
         # "alternating" accepts velocity and damping in separate iterations.
         # Use "cross_talk" on a diagnostic subset to evaluate velocity-only,
         # damping-only and joint proposals at every iteration.  "joint"
         # reproduces the historical coupled acceptance rule.
-        "local_update_strategy": "cross_talk",
+        "local_update_strategy": "joint",
         # D_f is computed for every local result.  The two spectral figures
         # follow plot_save_interval to avoid generating one folder per record.
         "local_spectral_diagnostics_enabled": True,
         # The next waveform reuses the accepted material profiles, not the
         # full space-time field.  Releasing it greatly lowers persistent RAM.
         "local_retain_wavefield": False,
-        "num_waveform2process"      : 1,     # int, equespatially waveforms to sample for processing. Of "None", process all
-        "maxtime2simulate"          : 25,           # [mus]
-        "frequency_cutoff"          : 8,            # [MHz] low pass onserved data and simulate up to this frequency
-        "minimum_SNR"               : 10,            # skip computation until time interval where signal should be is above SNR times surely-only-noise part 
-        "velocity_initial_list"     : np.linspace(0.1200, 0.1700, 30),  # [cm/mus] first guess of best velocity. There is a visual tool for it, if needed
-        "min_velocity2simulate"     : 0.10,         # [cm/mus] if not passed, computed by assembly and gouge velocity range
-        "max_velocity2simulate"     : 0.33,         # [cm/mus]
-        "damping_initial_list"      : np.linspace(0.000,0.0009, 10),
+        "num_waveform2process"      : None,     # int, equespatially waveforms to sample for processing. Of "None", process all
+        "maxtime2simulate"          : polarization['waveform_duration_us'],           # [mus]
+        "frequency_cutoff"          : polarization['frequency_cutoff_mhz'],            # [MHz] low pass onserved data and simulate up to this frequency
+        "minimum_SNR"               : 3,            # skip computation until time interval where signal should be is above SNR times surely-only-noise part 
+        "velocity_initial_list"     : polarization['velocity_values_cm_us'],  # [cm/mus] first guess of best velocity. There is a visual tool for it, if needed
+        "min_velocity2simulate"     : polarization['minimum_velocity_cm_us'],         # [cm/mus] if not passed, computed by assembly and gouge velocity range
+        "max_velocity2simulate"     : polarization['maximum_velocity_cm_us'],         # [cm/mus]
+        "damping_initial_list"      : polarization['damping_values_cm2_us'],
         "plot_save_interval"        : 1,
         "movie_save_interval"       : 15000,
         "l2norm_plot"               : True,
         "outdir_path_l2norm"        : outdir_path_l2norm[0],
         "outdir_path_image"         : outdir_path_image[0],
-        "n_iterations"              : 20,
+        "n_iterations"              : 80,
         "reduce_factor"             : 10/9,
 
         # densita', stimate
@@ -5016,22 +5382,95 @@ if __name__ == "__main__":
         "side2_density_g_cm3": 7.85,
     }
 
+    params.setdefault("local_optimizer", {})["minimum_gain_absolute"] = 1e-5
+    params.setdefault("adaptive_inversion", {}).update({
+    "gate_noise_factor": 0.75,
+    "gate_confirm_records": 1,
+})
+    
+    # Adaptive mode uses one chronological reference; global worker settings remain valid.
+    params['adaptive_inversion'] = {
+        'enabled': True,
+        'output_subdirectory': 'adaptive_noise',
+        'first_max_iterations': 500,
+        'update_max_iterations': 500,
+        'signal_window_us': None,
+        'noise_window_us': None,
+        'noise_end_us': 10.,
+        'gate_noise_quantile': 0.99,
+        'gate_noise_factor': 1.25,
+        'gate_calibration_records': 200,
+        'noise_stop_factor': 1.5,
+        'plateau_noise_fraction': 0.1,
+        'block_accepted_updates': 20,
+        'patience_blocks': 3,
+        'probe_factors': [2., 0.5],
+        'plot_reused_records': False,
+        'require_verified_reference': True,
+    }
+
+    # ADAPTIVE_INDEPENDENT_CONFIGURATION_V1
+    # Ogni onda parte dallo stesso modello della prima acquisizione.
+    params["adaptive_inversion"].setdefault("mode", "independent")
+    params["adaptive_inversion"].setdefault("initial_model", "local")  # oppure "homogeneous"
+    params["adaptive_inversion"].setdefault("velocity_lower_bound_m_s", None)
+
+    # Grafico delle differenze tra dati, dopo la GUI e prima di ogni inversione.
+    params['wave_difference_diagnostic'] = {
+        'enabled': True,
+        'only': False,  # True: salva grafico e termina; False: poi esegue la run normale
+        'window_us': None,  # None: finestra iniziale del misfit globale; oppure (inizio, fine)
+        'spectral_gamma': None,  # None: usa local_spectral_gamma
+        'taper_fraction': None,  # None: usa local_objective_taper_fraction
+    }
+
+    # MECHANICAL_SELECTION_VISUAL_CONFIG_V1
+    params["mechanical_selection_inspection"] = {
+        "enabled": False,
+        "only": False,  # True: salva le figure e termina prima dell'inversione
+        "script_path": None,  # None: visual_ispection_standard.py accanto a questo file
+        "window_us": None,  # None: stessa finestra iniziale dell'inversione
+        "save_pdf": False,
+        "processing_memory_mb": 32,
+        "processing_block_rows": 128,
+        "map_max_columns": 1600,
+        "map_max_rows": 1024,
+    }
+
+    # SUCCESSIVE_WAVES_NOISE_V2
+    params['wave_difference_diagnostic'].setdefault('noise_enabled', True)
+    params['wave_difference_diagnostic'].setdefault('noise_window_us', None)  # oppure (6., 10.)
+    params['wave_difference_diagnostic'].setdefault('noise_end_us', 10.)  # None sopra: stessa durata del segnale
+    params['mechanical_selection'] = mechanical_selection
+
+    # ORCHESTRATION_SAME_WAVE_RESTART_V2
+    params['local_restart'] = {
+        'enabled': False,  # True: altre iterazioni sulla stessa onda salvata
+        'pickle_path': None,  # None: pickle nella cartella di output attuale
+        'rec_n': 248338,  # None: ultimo risultato locale completato; oppure il record
+        'additional_iterations': 40,
+        'output_directory': None,  # None: local_continuations accanto al pickle sorgente
+        'reuse_last_step_limits': True,
+        'misfit_interval_us': None,  # solo per vecchi checkpoint senza finestra recuperabile
+    }
+
     # Load the Source Time Function (HDF5)
     stf_h5_path = (
-        dir_manager.paths.analysis_root("on_bench", "STF_pfake500_s250_multichannel")
-        / f"source_time_functions{wave_type}" 
-        / "stf.h5"
+        (Path(polarization['stf_h5_path']).expanduser()
+        if polarization['stf_h5_path'] is not None else
+        dir_manager.paths.analysis_root(polarization['stf_machine'], polarization['stf_experiment'])
+        / f'source_time_functions{wave_type}' / 'stf.h5')
     )
 
     # read the STF saved under /stf/width250_volt70/cycle_000000/source_waveform
     stf_handler = UltrasonicDataHandler.read_stf_hdf5(
         stf_h5_path,
-        name="s_70V_100nm",   # "width250_volt70_local_inversion" when available
-        cycle_index=0,
+        name=polarization['stf_name'],   # "width250_volt70_local_inversion" when available
+        cycle_index=polarization['stf_cycle_index'],
     )
 
     ########### HO MESSO UN TRONCAMENTO ARBITRATIO A 4 MUS #####################
-    stf_handler.waveform_data = stf_handler.truncate_time(4).waveform_data.squeeze(0)   # shape (L,) e c'e' anche un troncamento
+    stf_handler.waveform_data = stf_handler.truncate_time(polarization['stf_truncate_us']).waveform_data.squeeze(0)   # shape (L,) e c'e' anche un troncamento
     # plt.plot(stf_handler.metadata['time_ax_waveform'], stf_handler.waveform_data)
     # plt.show()
     # sys.exit()
@@ -5083,19 +5522,19 @@ if __name__ == "__main__":
         infile_name = infile_path.name.split(".")[0]
 
         print(infile_name)
-        if infile_name != "006_reload_ss_1_S":
+        if selected_uw_basename is not None and infile_name != selected_uw_basename:
             continue
 
         mech_data_slice = mechdata_slice4uw_processing(mech_data,
                                                        sync_peaks, 
                                                        chosen_uw_file, 
-                                                       num_waveform2process=params["num_waveform2process"])
+                                                       num_waveform2process=preprocessing_waveform_count(params))
 
         # Load & process ultrasonic data and metadata from TSV, with preprocessing
         uw_data_handler = (
             UltrasonicDataHandler.read_tsv(infile_path)
                 .remove_mean()
-                .downsample_waveforms(params["num_waveform2process"])     # keep N waveforms (evenly sampled)
+                .downsample_waveforms(preprocessing_waveform_count(params))     # keep N waveforms (evenly sampled)
                 .truncate_time(params["maxtime2simulate"])                # limit to maxtime [µs]
                 .zero_before(assembly_dict["steel_only_time_wave"] / 5) # zero early window [µs]
                 .bandpass(
@@ -5104,122 +5543,47 @@ if __name__ == "__main__":
                 )
         )
 
-        # import matplotlib.cm as cm
-        # import matplotlib.colors as colors
+ 
+        # # Diagnostica sincronizzazione: stampa solo pochi numeri
+        # _tu = np.asarray(uw_data_handler.metadata["time_ax_acquisition"], dtype=float)
+        # _tm = np.asarray(mech_data["time_s"], dtype=float)
+        # _sy = np.asarray(mech_data["sync"], dtype=float)
+        # _p0, _p1 = map(int, sync_peaks[2*chosen_uw_file:2*chosen_uw_file+2])
+        # _t0 = float(mech_data_slice["time_s"].iloc[0])
 
-        # # -----------------------------
-        # # Global matplotlib parameters
-        # # -----------------------------
-        # plt.rcParams.update({
-        #     "font.size": 12,
-        #     "axes.titlesize": 16,
-        #     "axes.titleweight": "bold",
-        #     "axes.labelsize": 14,
-        #     "axes.labelweight": "bold",
-        #     "xtick.labelsize": 12,
-        #     "ytick.labelsize": 12,
-        #     "xtick.major.size": 6,
-        #     "ytick.major.size": 6,
-        #     "xtick.major.width": 1.5,
-        #     "ytick.major.width": 1.5,
-        #     "axes.linewidth": 1.5,
-        # })
+        # print("SYNC FILE:", infile_path.name, "posizione:", chosen_uw_file)
+        # print("SYNC ELENCO FILE:", [p.name for p in infile_path_list_uw])
+        # print("SYNC UW: numero, primo, ultimo, passo_mediano:",
+        #       len(_tu), _tu[0], _tu[-1], np.median(np.diff(_tu)))
+        # print("SYNC UNITA UW:",
+        #       uw_data_handler.metadata.get("time_ax_acquisition_unit", "non dichiarata"))
+        # print("SYNC MECC: numero_sync, indici, tempi:",
+        #       len(sync_peaks), (_p0, _p1), (_tm[_p0], _tm[_p1]))
+        # print("SYNC DURATE: UW, fra_sync_meccanici:",
+        #       _tu[-1] - _tu[0], _tm[_p1] - _tm[_p0])
+        # print("SYNC MAPPATURA: origine_usata, fine_UW_assegnata, scarto_dal_sync_finale:",
+        #       _t0, _t0 + _tu[-1], _t0 + _tu[-1] - _tm[_p1])
 
-        # # -----------------------------
-        # # Metadata
-        # # -----------------------------
-        # t_acq = uw_data_handler.metadata.get("time_ax_acquisition", None)
-
+        # # Descrive anche la larghezza dei due impulsi.
+        # for _nome, _p in (("inizio", _p0), ("fine", _p1)):
+        #     _livello = 0.5 * _sy[_p]
+        #     _sinistra = _destra = _p
+        #     while _sinistra > 0 and _sy[_sinistra-1] >= _livello:
+        #         _sinistra -= 1
+        #     while _destra < len(_sy)-1 and _sy[_destra+1] >= _livello:
+        #         _destra += 1
+        #     print("SYNC IMPULSO:", _nome,
+        #           "livello_meta_picco:", _livello,
+        #           "tempi_primo_sopra_soglia/picco/ultimo_sopra_soglia:",
+        #           (_tm[_sinistra], _tm[_p], _tm[_destra]))
+        # meta = uw_data_handler.metadata
+        
+        # print("SYNC HEADER:", meta.get("raw_header"))
         # print(
-        #     "mech time start/end =",
-        #     mech_data_slice["time_s"].iloc[0],
-        #     mech_data_slice["time_s"].iloc[-1],
+        #     "SYNC RIGHE: lette, attese:",
+        #     meta.get("number_of_waveforms"),
+        #     meta.get("expected_number_of_waveforms"),
         # )
-        # print(f"num waves: {uw_data_handler.metadata.get('number_of_waveforms')}")
-
-        # time = uw_data_handler.metadata["time_ax_waveform"]
-        # data = uw_data_handler.waveform_data  # shape: (n_waveforms, n_samples)
-        # n_waveforms = data.shape[0]
-
-        # # -----------------------------
-        # # Colormap
-        # # -----------------------------
-        # norm = colors.Normalize(vmin=0, vmax=n_waveforms - 1)
-        # cmap = cm.winter
-
-        # # -----------------------------
-        # # Figure
-        # # -----------------------------
-        # fig, ax = plt.subplots(figsize=(9, 5.5))
-
-        # for i in range(n_waveforms):
-        #     ax.plot(
-        #         time,
-        #         data[i, :],
-        #         color=cmap(norm(i)),
-        #         alpha=0.25,
-        #         linewidth=0.8,
-        #     )
-
-        # # -----------------------------
-        # # Colorbar
-        # # -----------------------------
-        # sm = cm.ScalarMappable(norm=norm, cmap=cmap)
-        # sm.set_array([])
-
-        # cbar = fig.colorbar(
-        #     sm,
-        #     ax=ax,
-        #     pad=0.02,
-        #     aspect=30,
-        # )
-        # cbar.set_label(
-        #     "Experiment time progression",
-        #     fontsize=13,
-        #     fontweight="bold",
-        # )
-
-        # # Map waveform index → acquisition time
-        # cbar.set_ticks([0, n_waveforms // 2, n_waveforms - 1])
-        # cbar.set_ticklabels([
-        #     "Start",
-        #     "Mid",
-        #     "End",
-        # ])
-
-        # cbar.ax.tick_params(
-        #     width=1.5,
-        #     length=5,
-        #     labelsize=11,
-        # )
-
-        # # -----------------------------
-        # # Axes formatting
-        # # -----------------------------
-        # ax.set_xlabel("Waveform time [µs]")
-        # ax.set_ylabel("Amplitude [a.u.]")
-        # ax.set_title("Ultrasonic Waveform Evolution Over Experiment Time", pad=12)
-
-        # ax.tick_params(
-        #     direction="in",
-        #     which="both",
-        #     top=True,
-        #     right=True,
-        # )
-
-        # ax.minorticks_on()
-
-        # ax.grid(
-        #     which="major",
-        #     linestyle="--",
-        #     linewidth=0.6,
-        #     alpha=0.4,
-        # )
-
-        # plt.tight_layout()
-        # plt.show()
-        # sys.exit()
-
         if not params["diagnostic_plot_only"]:
             process_uw_file(
                 infile_path=infile_path,
