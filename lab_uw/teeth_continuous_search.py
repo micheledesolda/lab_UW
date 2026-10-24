@@ -65,25 +65,10 @@ def _edges(values):
     mid=(values[1:]+values[:-1])/2
     return np.r_[values[0]-(mid[0]-values[0]),mid,values[-1]+values[-1]-mid[-1]]
 
-def _maps(rows,outdir,mode):
-    import matplotlib.pyplot as plt
-    keys=sorted(set((r['nu'],r['damping_cm2_us']) for r in rows));velocity='cp' if mode==0 else 'cs'
-    for metric,name in [('misfit','complete_misfit'),('spectral_distance','spectral_shape_distance')]:
-        for page,start in enumerate(range(0,len(keys),4)):
-            selected=keys[start:start+4]
-            fig,axes=plt.subplots(1 if len(selected)<=2 else 2,min(2,len(selected)),
-                figsize=(6*min(2,len(selected)),4.5*(1 if len(selected)<=2 else 2)),squeeze=False,constrained_layout=True)
-            for ax,(poisson,damping) in zip(axes.flat,selected):
-                subset=[r for r in rows if r['nu']==poisson and r['damping_cm2_us']==damping]
-                rho=np.unique([r['rho'] for r in subset]);v=np.unique([r[velocity]*1000 for r in subset])
-                image=np.full((len(rho),len(v)),np.nan)
-                for r in subset:image[np.searchsorted(rho,r['rho']),np.searchsorted(v,r[velocity]*1000)]=r[metric]
-                im=ax.pcolormesh(_edges(v),_edges(rho),image,shading='flat')
-                ax.set(xlabel=f'{velocity} [m/s]',ylabel='rho [g/cm3]',title=f'Poisson={poisson:g}; damping={damping:g} cm²/us')
-                fig.colorbar(im,ax=ax,label=metric)
-            for ax in list(axes.flat)[len(selected):]:ax.set_visible(False)
-            suffix='' if len(keys)<=4 else f'_{page+1:02d}'
-            fig.savefig(outdir/f'{name}{suffix}.png',dpi=160);plt.close(fig)
+def _maps(rows, outdir, mode):
+    # PROFILED_CONSTITUTIVE_MAPS_V1
+    from .material_search_maps import plot_teeth_maps
+    return plot_teeth_maps(rows, outdir, mode)
 
 def _return_result(context,results,best,selected,meta,spectral):
     mode=context['mode'];assembly=context['assembly']

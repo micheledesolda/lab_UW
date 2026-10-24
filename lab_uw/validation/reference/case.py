@@ -22,7 +22,7 @@ from typing import Any, Literal, Optional
 import numpy as np
 
 
-WaveletFilterMode = Literal["already_filtered", "apply"]
+WaveletFilterMode = Literal["already_filtered", "apply", "from_tsv"]
 
 
 def _acquisition_stem(path: Path | str) -> str:
@@ -284,6 +284,8 @@ def load_reference_case(
     observed_handler = _single_channel(
         UltrasonicDataHandler.read_tsv(tsv_path), channel_name
     )
+    if wavelet_filter_mode == "from_tsv":
+        observed_handler.remove_mean()
     if number_of_waveforms is not None:
         observed_handler.downsample_waveforms(number_of_waveforms)
     if freqmin_mhz is not None or freqmax_mhz is not None:
@@ -326,7 +328,7 @@ def load_reference_case(
                 freqmax=freqmax_mhz,
                 order=filter_order,
             )
-    elif wavelet_filter_mode != "already_filtered":
+    elif wavelet_filter_mode not in {"already_filtered", "from_tsv"}:
         raise ValueError(f"unknown wavelet_filter_mode={wavelet_filter_mode!r}")
 
     observed_time = np.asarray(
@@ -351,6 +353,13 @@ def load_reference_case(
     if wavelet_time[0] < observed_time[0] or wavelet_time[-1] > observed_time[-1]:
         raise ValueError("the HDF5 wavelet time axis lies outside the TSV record")
     observed_direct = np.interp(wavelet_time, observed_time, observed)
+    # STEEL_REFERENCE_AMPLITUDE_V1
+    # Re-extract from the newly filtered FULL record. The old HDF5 supplies
+    # only the extraction axis, so there is no second filtering of a packet.
+    if wavelet_filter_mode == "from_tsv":
+        wavelet = observed_direct.copy()
+        wavelet_filter_verified = True
+        wavelet_filter_verification_method = "reextracted_from_filtered_full_tsv"
     direct_zero_mean = observed_direct - np.mean(observed_direct)
     wavelet_zero_mean = wavelet - np.mean(wavelet)
     denominator = np.linalg.norm(direct_zero_mean) * np.linalg.norm(wavelet_zero_mean)

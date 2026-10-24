@@ -193,18 +193,9 @@ def forward_with_bank(model, args):
     return predicted, None, vm, timing, grid, sh, rh
 
 def _maps(rows, outdir):
-    import matplotlib.pyplot as plt
-    for metric, filename in [('misfit', 'complete_misfit.png'), ('spectral_distance', 'spectral_shape_distance.png')]:
-        fig, axes = plt.subplots(2, 2, figsize=(11, 8), constrained_layout=True)
-        densities = np.unique([r['rho'] for r in rows]); velocities = np.unique([r['cs'] for r in rows])
-        for ax, nu in zip(axes.flat, np.linspace(.15, .45, 4)):
-            grid = np.full((len(densities), len(velocities)), np.nan)
-            for r in rows:
-                if np.isclose(r['nu'], nu): grid[np.searchsorted(densities, r['rho']), np.searchsorted(velocities, r['cs'])] = r[metric]
-            im = ax.imshow(grid, origin='lower', aspect='auto', extent=[velocities[0]*1000-.01, velocities[-1]*1000+.01, densities[0]-.01, densities[-1]+.01])
-            ax.set(xlabel='cS [m/s]', ylabel='rho [g/cm3]', title=f'Poisson = {nu:.2f}')
-            fig.colorbar(im, ax=ax, label=metric)
-        fig.savefig(outdir/filename, dpi=160); plt.close(fig)
+    # PROFILED_CONSTITUTIVE_MAPS_V1
+    from .material_search_maps import plot_teeth_maps
+    return plot_teeth_maps(rows, outdir)
 
 def search_bank_global(observed_waveform, waveform_metadata, outfile_name, stf_handler, params, assembly_dict):
     from .forward_modeling import UltrasonicModeler

@@ -33,13 +33,13 @@ MECHANICAL_INSPECTION_API = 1
 
 # ---------------- USER CONFIGURATION ----------------
 base_dir = "/home/michele/Desktop/Dottorato/active_source_implementation"
-machine_name = "big_biax"
-experiment_name = "r0072suw03anhdol_6035"
-data_type = "uw_data/data_tsv_files_s"
+machine_name = "on_bench"
+experiment_name = "STF_pfake500_s250_multichannel"
+data_type = "uw_data/data_tsv_files/only_p"
 
 # IMPORTANT: replace these illustrative limits with those in the inversion.
 # This single window controls every direct-arrival figure AND its FFT input.
-direct_window_us = (20.0, 25.0)
+direct_window_us = (15.0, 18.7)
 direct_window_overrides_us = {
     # "001_runin_P.bscan.tsv": (10.0, 16.0),
     # ("001_runin_P.bscan.tsv", "ch2"): (10.5, 15.5),
@@ -49,8 +49,8 @@ number_of_example_waveforms = 3   # first, middle, last; per file and channel
 example_indices = None           # optional explicit indices, e.g. [0, 1200, 2400]
 number_of_overlay_waveforms = 12
 
-freq_min = None                   # MHz; None for a low-pass filter
-freq_max = 12.0                   # MHz; None for a high-pass filter
+freq_min = 0.1                   # MHz; None for a low-pass filter
+freq_max = 6.0                   # MHz; None for a high-pass filter
 filter_order = 4
 spectrum_max_mhz = 12.0           # plot limit; None displays the Nyquist range
 show_filter_response = False      # optional dimensionless secondary axis

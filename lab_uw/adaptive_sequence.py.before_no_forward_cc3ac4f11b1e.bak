@@ -1,0 +1,637 @@
+"""One chronological reference, noise-based model reuse, and explicit stop reasons."""
+from __future__ import annotations
+from copy import deepcopy
+import hashlib
+import json
+from pathlib import Path
+import pickle
+import io
+import os
+import tempfile
+
+import numpy as np
+from scipy.signal.windows import tukey
+
+from .wave_difference_preinversion import _noise_window
+from .orchestration_restart import enrich_local_checkpoint, _restore_runtime, merge_iteration_history
+from .adaptive_diagnostics import record_gate, confirm_gate, reusable_step_limits
+from .kinematic_velocity import ensure_reference, reference_from_state, result_fields
+from .material_optimizer import (settings as optimizer_settings, policy_digest as optimizer_policy_digest,
+                                 policy_changes as optimizer_policy_changes)
+
+
+DEFAULTS={
+    'mode':'sequential','initial_model':'local','velocity_lower_bound_m_s':None,'gate_enabled':True,
+    'enabled':True,'first_max_iterations':500,'update_max_iterations':100,
+    'output_subdirectory':'adaptive_noise',
+    'signal_window_us':None,'noise_window_us':None,'noise_end_us':10.,
+    'gate_noise_quantile':.99,'gate_noise_factor':1.25,'gate_calibration_records':200,
+    'noise_stop_factor':1.5,'plateau_noise_fraction':.1,
+    'block_accepted_updates':20,'patience_blocks':3,'probe_factors':[2.,.5],
+    'plot_reused_records':False,
+    'require_verified_reference':True,
+    # New-wave policy; first calibration and pending continuations retain their policy.
+    'update_block_accepted_updates':10,'update_patience_blocks':1,'update_plateau_noise_fraction':1.,
+    'gate_confirm_records':2,'gate_strong_factor':2.,'reuse_last_step_limits':True,
+    'plot_gate_updates':True,'plot_gate_reused_records':False,
+}
+
+
+POLICY_KEYS=('update_block_accepted_updates','update_patience_blocks','update_plateau_noise_fraction',
+             'gate_confirm_records','gate_strong_factor','reuse_last_step_limits')
+EXTRA_KEYS=POLICY_KEYS+('plot_gate_updates','plot_gate_reused_records')
+
+def _policy_digest(s):
+    return hashlib.sha256(json.dumps({k:s[k] for k in POLICY_KEYS},sort_keys=True).encode()).hexdigest()
+
+def _adopt_policy(state,s):
+    expected=_policy_digest(s)
+    previous=state.get('efficiency_policy_fingerprint')
+    if previous is not None and previous!=expected:
+        raise ValueError('New-wave efficiency policy changed; use a new output folder or restore its settings.')
+    if previous is None:
+        print('Adaptive efficiency policy v2: completed records retained; pending-wave policy retained; new acquisitions use the new policy.',flush=True)
+    state['efficiency_policy_fingerprint']=expected
+    state['efficiency_policy_revision']=2
+
+def _adopt_optimizer_policy(state,params):
+    policy=optimizer_settings(params)
+    expected=optimizer_policy_digest(policy)
+    previous=state.get('optimization_policy_fingerprint')
+    if previous is not None and previous!=expected:
+        stopping=state.get('pending_stopping') or {}
+        continuation=stopping.get('continuation') or {}
+        old=continuation.get('policy')
+        if (state.get('pending_position') is None or stopping.get('converged',False)
+                or continuation.get('optimizer_revision') not in (3, 4, 5) or old is None):
+            raise ValueError('Material optimizer policy changed after a completed reference. '
+                             'Use a separate result sequence to verify that reference with new settings.')
+        if optimizer_policy_digest(old)!=previous:
+            raise ValueError('Pending optimizer policy and saved fingerprint disagree; resume refused.')
+        changes=optimizer_policy_changes(old,policy)
+        change={'position':int(state['pending_position']),
+                'rec_n':int(state['reference_rec_n']),
+                'iteration':int(continuation.get('last_iteration',0)),
+                'old_fingerprint':previous,'new_fingerprint':expected,'changes':changes}
+        state.setdefault('optimization_policy_changes',[]).append(change)
+        print('Adaptive optimizer policy change: continue SAME pending waveform and accepted model. '
+              +json.dumps(changes,sort_keys=True),flush=True)
+    state['optimization_policy_fingerprint']=expected
+    state['optimization_policy']=deepcopy(policy)
+    state['optimization_revision']=3
+
+def settings(params):
+    return {**deepcopy(DEFAULTS),**params.get('adaptive_inversion',{})}
+
+
+def enabled(params):
+    return bool(params.get('adaptive_inversion',{}).get('enabled',False))
+
+
+def prepare_params(params):
+    if not enabled(params):return params
+    validate(params)
+    result=dict(params)
+    directory=settings(params)['output_subdirectory']
+    if directory:
+        if Path(directory).is_absolute() or len(Path(directory).parts)!=1 or directory in ('.','..'):
+            raise ValueError('output_subdirectory must be one relative folder name or None.')
+        for key in ('outdir_path_l2norm','outdir_path_image'):
+            result[key]=Path(params[key])/directory
+            result[key].mkdir(parents=True,exist_ok=True)
+    if settings(params)['mode']=='independent':
+        for key in ('outdir_path_l2norm','outdir_path_image'):
+            result[key]=Path(result[key])/('independent_'+settings(params)['initial_model'])
+            result[key].mkdir(parents=True,exist_ok=True)
+    return result
+
+
+def validate(params):
+    if not enabled(params):return
+    s=settings(params)
+    if s['mode'] not in ('sequential','independent'):raise ValueError('adaptive_inversion.mode: sequential or independent required.')
+    if s['initial_model'] not in ('homogeneous','local'):raise ValueError('adaptive_inversion.initial_model: homogeneous or local required.')
+    if not isinstance(s['gate_enabled'],(bool,np.bool_)):raise ValueError('gate_enabled must be True or False.')
+    bound=s['velocity_lower_bound_m_s']
+    if bound is not None and (not np.isfinite(bound) or bound<=0):raise ValueError('velocity_lower_bound_m_s must be positive and finite or None.')
+    if not params.get('run_local_inversion',True):
+        raise ValueError('Adaptive inversion requires run_local_inversion=True.')
+    if float(params.get('local_spectral_gamma',1.))!=1.:
+        raise ValueError('Adaptive noise criteria require local_spectral_gamma=1. Disable adaptive_inversion for gamma!=1.')
+    if params.get('teeth_bank_enabled',False) or params.get('teeth_continuous_enabled',False):
+        raise ValueError('Adaptive inversion is implemented for the original FD/Kelvin-Voigt forward.')
+    for key in ('first_max_iterations','update_max_iterations','gate_calibration_records','block_accepted_updates','patience_blocks','update_block_accepted_updates','update_patience_blocks','gate_confirm_records'):
+        x=s[key]
+        if isinstance(x,bool) or int(x)!=x or int(x)<1:raise ValueError(f'{key}: positive integer required.')
+    for key in ('gate_noise_factor','noise_stop_factor','plateau_noise_fraction','update_plateau_noise_fraction','gate_strong_factor'):
+        if not np.isfinite(s[key]) or s[key]<=0:raise ValueError(f'{key}: positive finite value required.')
+    if not 0<s['gate_noise_quantile']<1:raise ValueError('gate_noise_quantile must be in (0,1).')
+    if s['gate_strong_factor']<1:raise ValueError('gate_strong_factor must be >= 1.')
+    if not s['probe_factors']:raise ValueError('At least one step probe is required for adaptive plateau stopping.')
+    for factor in s['probe_factors']:
+        if not np.isfinite(factor) or factor<=0:raise ValueError('probe_factors must be positive and finite.')
+
+
+def _digest(functions,paired_rows,waveform_metadata,stf,params,observed_waveform_data):
+    keys=('local_spectral_gamma','local_objective_taper_fraction','local_update_strategy','reduce_factor',
+          'frequency_min','frequency_cutoff','embedding_mode','boundary_condition','source_injection',
+          'receiver_quantity','absorbing','source_receiver_config','points_per_wavelength',
+          'min_velocity2simulate','max_velocity2simulate','maxtime2simulate',
+          'local_velocity_step_fraction','local_damping_step_fraction',
+          'local_velocity_step_threshold_fraction','local_damping_step_threshold_fraction')
+    def encode(v):
+        if isinstance(v,np.ndarray):return v.tolist()
+        if isinstance(v,np.generic):return v.item()
+        if isinstance(v,Path):return str(v)
+        raise TypeError(f'Cannot fingerprint {type(v).__name__}')
+    science=settings(params)
+    # Preserve fingerprints of existing sequential runs exactly.
+    if science['mode']=='sequential':
+        for key in ('mode','initial_model','velocity_lower_bound_m_s'):science.pop(key,None)
+        if science['gate_enabled']:science.pop('gate_enabled')
+    # Iteration budgets may be raised for a pending reference without changing the objective/criteria.
+    science.pop('first_max_iterations');science.pop('update_max_iterations')
+    # Keep the existing data/objective fingerprint for a documented v1 -> v2 upgrade.
+    # New scientific controls have their own fingerprint in every adaptive state.
+    if science.get('mode')=='independent':
+        # The independent job plan is frozen before the workers run. Its gate
+        # confirmation controls must therefore be part of the plan identity.
+        for key in ('plot_gate_updates','plot_gate_reused_records'):
+            science.pop(key,None)
+    else:
+        for key in EXTRA_KEYS:science.pop(key,None)
+    value={'adaptive':science,'numeric':{k:params.get(k) for k in keys}}
+    # STEEL_REFERENCE_AMPLITUDE_V1
+    from lab_uw.source_amplitude import validate_handler
+    calibration=validate_handler(stf)
+    if calibration is not None:value['source_calibration_id']=calibration['id']
+    h=hashlib.sha256(json.dumps(value,sort_keys=True,default=encode).encode())
+    table=np.array([[int(r.uw_idx),float(r.uw_time_s),float(r.time_s)] for r in paired_rows],dtype='<f8')
+    # Mechanical observations also control the evolving geometry and stored
+    # stresses. A changed table must not be appended to the previous run.
+    mechanical_records=[dict(r._asdict()) for r in paired_rows]
+    h.update(json.dumps(mechanical_records,sort_keys=True,default=encode).encode())
+    for array in (table,waveform_metadata['time_ax_waveform'],stf.waveform_data,stf.metadata['time_ax_waveform']):
+        h.update(np.asarray(array).tobytes())
+    if len(table)>1 and np.any(np.diff(table[:,1])<=0):raise ValueError('Adaptive records must be in acquisition-time order.')
+    for row in paired_rows:h.update(np.asarray(observed_waveform_data[int(row.uw_idx)]).tobytes())
+    return h.hexdigest()
+
+
+def _masks(simulation,s):
+    t=np.asarray(simulation.observed_time)
+    explicit=s['signal_window_us']
+    if explicit is None:
+        mask=np.zeros(len(t),bool);mask[simulation.misfit_interval]=True
+    else:
+        a,b=map(float,explicit)
+        if not np.isfinite(a+b) or a>=b or a<t[0] or b>t[-1]:raise ValueError('Invalid signal_window_us.')
+        mask=(t>=a)&(t<=b)
+    if np.count_nonzero(mask)<3:raise ValueError('Adaptive signal window is too short.')
+    noise,_=_noise_window(t,mask,{'noise_enabled':True,'noise_window_us':s['noise_window_us'],'noise_end_us':s['noise_end_us']})
+    return mask,noise
+
+
+def _weights(mask,taper):
+    n=int(np.count_nonzero(mask))
+    return tukey(n,alpha=taper) if taper else np.ones(n)
+
+
+def _levels(data,signal_mask,noise_mask,taper):
+    ws,wn=_weights(signal_mask,taper),_weights(noise_mask,taper)
+    d=ws*np.asarray(data)[signal_mask];n=wn*np.asarray(data)[noise_mask]
+    if not np.all(np.isfinite(d)) or not np.all(np.isfinite(n)) or float(d@d)<=1e-30 or float(n@n)<=1e-30:
+        raise ValueError('Adaptive thresholds require finite nonzero signal and noise; check preprocessing and windows.')
+    return float(d@d),float(n@n),float(ws@ws)/float(wn@wn)
+
+
+def configure_local_stopping(simulation,params):
+    """Called by the orchestration immediately before the original local solver."""
+    simulation.scientific_stop_policy=None
+    simulation.scientific_stop_resume_state=None
+    simulation.optimization_policy=None
+    simulation.optimization_resume_state=None
+    # LOCAL_MATERIAL_COORDINATES_V1
+    from .material_parameters import parameterization
+    coordinate_policy = optimizer_settings(params)
+    simulation.local_material_parameterization = parameterization(coordinate_policy)
+    # LOCAL_DENSITY_INVERSION_V1
+    from .density_inversion import prepare
+    prepare(simulation, coordinate_policy)
+    if not enabled(params):
+        if simulation.local_material_parameterization == "modulus_viscosity" or coordinate_policy.get("invert_density", False):
+            simulation.optimization_policy = coordinate_policy
+            simulation.optimization_resume_state = deepcopy(params.get("_adaptive_resume_monitor"))
+        return
+    s=settings(params)
+    if hasattr(simulation,'adaptive_signal_mask'):
+        simulation.misfit_interval=simulation.adaptive_signal_mask.copy()
+        noise=simulation.adaptive_noise_mask
+    else:
+        mask,noise=_masks(simulation,s);simulation.misfit_interval=mask
+    if params.get('_adaptive_reuse',False):return
+    taper=float(params.get('local_objective_taper_fraction',0.))
+    ed,en,factor=_levels(simulation.observed_waveform,simulation.misfit_interval,noise,taper)
+    b=factor*en/ed
+    policy=optimizer_settings(params)
+    if policy['enabled']:
+        simulation.optimization_policy=policy
+        simulation.optimization_resume_state=deepcopy(params.get('_adaptive_resume_monitor'))
+        simulation.optimization_noise_level=b
+        simulation.adaptive_stop_context='first_reference' if params.get('_adaptive_first_reference',False) else 'new_acquisition'
+        return
+    simulation.scientific_stop_policy={'enabled':True,'noise_level_single':b,
+        'noise_target':s['noise_stop_factor']*b,'minimum_block_gain':s['plateau_noise_fraction']*b,
+        'block_accepted_updates':s['block_accepted_updates'],'patience_blocks':s['patience_blocks'],
+        'probe_factors':list(s['probe_factors'])}
+    resume=deepcopy(params.get('_adaptive_resume_monitor'))
+    if resume is not None:
+        simulation.scientific_stop_policy=deepcopy(resume['policy'])
+        simulation.scientific_stop_resume_state=resume
+    elif not params.get('_adaptive_first_reference',False):
+        simulation.scientific_stop_policy.update(
+            minimum_block_gain=s['update_plateau_noise_fraction']*b,
+            block_accepted_updates=s['update_block_accepted_updates'],
+            patience_blocks=s['update_patience_blocks'])
+    simulation.adaptive_stop_context='first_reference' if params.get('_adaptive_first_reference',False) else 'new_acquisition'
+
+
+def _reference_threshold(observed,position,rows,data,signal_mask,noise_mask,taper,s):
+    ed,_,factor=_levels(observed,signal_mask,noise_mask,taper)
+    wn=_weights(noise_mask,taper)
+    ref=wn*observed[noise_mask]
+    values=[]
+    # Noise only: future observations calibrate a fixed reference threshold.
+    # No arrival data are used to decide the reference's noise threshold.
+    for row in rows[position+1:position+1+int(s['gate_calibration_records'])]:
+        sample=wn*np.asarray(data[int(row.uw_idx)])[noise_mask]
+        if np.all(np.isfinite(sample)) and float(sample@sample)>1e-30:
+            delta=sample-ref;values.append(factor*float(delta@delta)/ed)
+    if values:
+        typical=float(np.quantile(values,s['gate_noise_quantile']))
+    else:
+        # No calibration pairs remain. Conservative independent-noise fallback.
+        _,en,_=_levels(observed,signal_mask,noise_mask,taper)
+        typical=2*factor*en/ed
+    return s['gate_noise_factor']*typical,{'samples':len(values),'quantile':s['gate_noise_quantile'],
+        'factor':s['gate_noise_factor'],'typical_noise_pair_misfit':typical,
+        'calibration':'first available noise windows after reference; fallback 2*single noise if none remain'}
+
+
+def gate_decision(reference,current,signal_mask,noise_mask,taper,threshold,objective,s):
+    j=float(objective(reference,current,signal_mask,spectral_gamma=1.,taper_fraction=taper)['total'])
+    ed,_,factor=_levels(reference,signal_mask,noise_mask,taper)
+    wn=_weights(noise_mask,taper);n0=wn*reference[noise_mask];n1=wn*current[noise_mask]
+    if not np.all(np.isfinite(n1)) or float(n1@n1)<=1e-30:
+        raise ValueError('Current noise window is zero or nonfinite; cannot decide model reuse.')
+    delta=n1-n0;pair=factor*float(delta@delta)/ed
+    # If noise grows, increase the threshold rather than interpreting it as material change.
+    effective=max(float(threshold),s['gate_noise_factor']*pair)
+    return j<=effective,{'data_reference_misfit':j,'noise_pair_misfit':pair,
+                         'calibrated_threshold':float(threshold),'effective_threshold':effective}
+
+
+def _write_row(functions,stream,simulation,assembly,result,state,action,decision,grid_before):
+    row=functions['_build_local_result_row'](int(assembly['rec_n']),assembly,simulation,result)
+    row.update(result_fields(simulation))
+    row['local_continuation_state']=enrich_local_checkpoint(row['local_continuation_state'],simulation)
+    for name in ('_kinematic_reference','_kinematic_cache','kinematic_velocity_m_s','kinematic_arrival_us','kinematic_diagnostics'):
+        if hasattr(simulation,name):
+            row['local_continuation_state']['simulation_attributes'][name]=deepcopy(getattr(simulation,name))
+    row['local_anchor_stride']=1
+    row['local_records_per_worker']=1
+    stopping=getattr(simulation,'local_stop_diagnostics',None) or {}
+    if stopping and stopping.get('initial_misfit') is not None:
+        gain=float(stopping['initial_misfit'])-float(simulation.misfit)
+        level=stopping.get('noise_level_single')
+        row['adaptive_update_gain']={'absolute_gain':gain,'noise_level_single':level,
+            'gain_over_noise':None if not level else gain/float(level),
+            'context':getattr(simulation,'adaptive_stop_context',None),
+            'interpretation':'Operational gain scale, not a statistical significance test.'}
+    row['adaptive_state']=deepcopy(state)
+    row['adaptive_inversion']={'schema':1,'action':action,'model_origin_rec_n':int(state['reference_rec_n']),
+        'reference_idx_wave':int(state['reference_idx_wave']),'reference_position':int(state['reference_position']),
+        'reference_stop_reason':state.get('reference_stop_reason'),'reference_ready':state.get('reference_ready',True),
+        'stop_reason':('model_reused_pending_change_confirmation' if decision.get('gate_status')=='awaiting_confirmation'
+                       else 'model_reused_noise_compatible') if action=='reused' else (simulation.local_stop_diagnostics or {}).get('reason','budget_exhausted'),
+        'optimized':action!='reused','geometry_grid_changed':not np.array_equal(grid_before,simulation.grid_handler.spatial_axis),
+        'decision':decision,'local_stopping':deepcopy(getattr(simulation,'local_stop_diagnostics',None))}
+    pickle.dump(row,stream,protocol=pickle.HIGHEST_PROTOCOL);stream.flush()
+    return row
+
+
+def _pending_path(results_pkl):
+    return Path(results_pkl).with_name(Path(results_pkl).name+'.adaptive_pending.pkl')
+
+
+def _save_pending(path,row):
+    path=Path(path);fd,temp=tempfile.mkstemp(prefix=path.name+'.',dir=path.parent)
+    try:
+        with os.fdopen(fd,'wb') as f:
+            pickle.dump(row,f,protocol=pickle.HIGHEST_PROTOCOL);f.flush();os.fsync(f.fileno())
+        os.replace(temp,path)
+    finally:
+        if Path(temp).exists():Path(temp).unlink()
+
+
+def _finish_legacy_reference_in_branch(functions,*,global_row,results_pkl,paired_rows,
+                                     observed_waveform_data,waveform_metadata,outfile_name,params,
+                                     assembly_dict,stf_handler):
+    """Finish the ORIGINAL first wave before replaying later data-change gates.
+
+    Historical rows are left intact. The first accepted local model is the
+    warm start; the global homogeneous state remains the kinematic reference.
+    """
+    source=Path(results_pkl);branch=source.parent/'optimizer_v3'/source.name
+    branch_params=dict(params)
+    branch_params['outdir_path_image']=Path(params['outdir_path_image'])/'optimizer_v3'
+    branch_params['outdir_path_l2norm']=branch.parent
+    branch_params['outdir_path_image'].mkdir(parents=True,exist_ok=True)
+    if not branch.exists():
+        first=None
+        with source.open('rb') as stream:
+            while True:
+                try:row=pickle.load(stream)
+                except EOFError:break
+                if 'global_best_misfit' not in row and int(row['idx_wave'])==int(global_row['idx_wave']):
+                    first=row;break
+        if first is None:raise ValueError('Cannot recover the original first local reference checkpoint.')
+        seed=deepcopy(first['local_continuation_state'])
+        attrs=seed['simulation_attributes']
+        if '_kinematic_reference' not in attrs:
+            try:attrs['_kinematic_reference']=reference_from_state(global_row['global_continuation_state'])
+            except ValueError as error:attrs['_kinematic_reference']={'schema':1,'unavailable_reason':str(error)}
+        upgraded=deepcopy(global_row)
+        upgraded['optimizer_reference_seed']=seed
+        upgraded['optimizer_upgrade']={'revision':3,'source_results':str(source),
+            'source_first_rec_n':int(first['rec_n']),
+            'reason':'Legacy convergence did not verify searched material optimization; finish the first wave before processing later data.'}
+        branch.parent.mkdir(parents=True,exist_ok=True)
+        _save_pending(branch,upgraded)
+    print(f'Optimizer upgrade: old completed reference is not assumed converged. '
+          f'Continuing the ORIGINAL first acquisition from its accepted model in {branch}. '
+          f'Historical results remain at {source}.',flush=True)
+    resume_file(functions,results_pkl=branch,paired_rows=paired_rows,
+        observed_waveform_data=observed_waveform_data,waveform_metadata=waveform_metadata,
+        outfile_name=outfile_name,params=branch_params,assembly_dict=assembly_dict,stf_handler=stf_handler)
+
+
+def run_sequence(functions,*,paired_rows,start_position,observed_waveform_data,waveform_metadata,
+                 outfile_name,params,assembly,simulation,stf_handler,stream,state=None):
+    if settings(params)['mode']=='independent':
+        from .adaptive_independent import run_sequence as run_independent
+        return run_independent(functions,paired_rows=paired_rows,start_position=start_position,
+            observed_waveform_data=observed_waveform_data,waveform_metadata=waveform_metadata,
+            outfile_name=outfile_name,params=params,assembly=assembly,simulation=simulation,
+            stf_handler=stf_handler,stream=stream)
+    validate(params);s=settings(params)
+    fingerprint=_digest(functions,paired_rows,waveform_metadata,stf_handler,params,observed_waveform_data)
+    if state is None:
+        signal,noise=_masks(simulation,s)
+        state={'schema':1,'fingerprint':fingerprint,'signal_mask':signal,'noise_mask':noise,
+               'reference_observed':None,'reference_position':None}
+    elif state['fingerprint']!=fingerprint:
+        raise ValueError('Adaptive resume settings/data selection/STF changed. Restore settings or use a new output folder.')
+    _adopt_policy(state,s)
+    _adopt_optimizer_policy(state,params)
+    simulation.adaptive_signal_mask=state['signal_mask'].copy()
+    simulation.adaptive_noise_mask=state['noise_mask'].copy()
+    simulation._require_local_model_adjoint_configuration()
+    ensure_reference(simulation)
+    optimized=reused=0
+    for position in range(start_position,len(paired_rows)):
+        row=paired_rows[position]
+        functions['update_assembly_dict_with_mech_data'](assembly_dict=assembly,mech_data=row)
+        observed=np.asarray(observed_waveform_data[int(row.uw_idx)])
+        if not np.all(np.isfinite(observed[state['signal_mask']])):
+            raise ValueError(f'rec_n={assembly["rec_n"]}: nonfinite selected data; no checkpoint written.')
+        simulation.observed_waveform=observed
+        continuing=state.get('pending_position')==position
+        first=state['reference_observed'] is None or (continuing and state.get('pending_is_first',False))
+        decision=deepcopy(state.get('pending_decision',{})) if continuing else {}
+        reuse=False
+        gate_reference=state.get('pending_gate_reference_observed') if continuing else state.get('reference_observed')
+        gate_reference_rec=state.get('pending_gate_reference_rec_n') if continuing else state.get('reference_rec_n')
+        gate_reference_time=state.get('pending_gate_reference_time_s') if continuing else state.get('reference_time_s')
+        if not first and not continuing:
+            reuse,decision=gate_decision(state['reference_observed'],observed,state['signal_mask'],state['noise_mask'],
+                float(params.get('local_objective_taper_fraction',0.)),state['reference_threshold'],
+                functions['relative_waveform_objective'],s)
+            if s['gate_enabled']:
+                reuse=confirm_gate(state,decision,reuse,s)
+            else:
+                reuse=False
+                decision.update(gate_status='gate_disabled',gate_confirmation_count=0,will_optimize=True)
+            decision.update(reference_rec_n=int(state['reference_rec_n']),current_rec_n=int(assembly['rec_n']),
+                reference_time_s=float(state['reference_time_s']),current_time_s=float(row.time_s))
+        if decision and gate_reference is not None:
+            diagnostics=record_gate(time=simulation.observed_time,reference=gate_reference,current=observed,
+                signal_mask=state['signal_mask'],noise_mask=state['noise_mask'],decision=decision,
+                output_directory=Path(params['outdir_path_image'])/'reference_comparisons',prefix=outfile_name,
+                write_plot=(s['plot_gate_updates'] and not reuse) or s['plot_gate_reused_records'] or decision.get('gate_status')=='awaiting_confirmation',
+                append_csv=not continuing)
+            print(f'Adaptive gate: reference={decision["reference_rec_n"]}, current={assembly["rec_n"]}, '
+                  f'D={diagnostics["relative_L2_norm"]:.5g}, J_data={decision["data_reference_misfit"]:.6g}, '
+                  f'J_noise={decision["noise_pair_misfit"]:.6g}, threshold={decision["effective_threshold"]:.6g}, '
+                  f'{decision.get("gate_status","pending")}',flush=True)
+        local_params=dict(params)
+        local_params['_adaptive_reuse']=reuse
+        local_params['_adaptive_first_reference']=first
+        if not first and not reuse and not continuing and s['reuse_last_step_limits']:
+            learned=reusable_step_limits(state.get('last_step_limits'),params['reduce_factor'])
+            if learned is not None:local_params['_adaptive_resume_limits']=learned
+        local_params['n_iterations']=0 if reuse else int(s['first_max_iterations'] if first else s['update_max_iterations'])
+        previous_history=[]
+        if continuing:
+            previous_history=deepcopy(simulation.local_inversion_history)
+            local_params['_adaptive_resume_monitor']=state['pending_stopping']['continuation']
+            local_params['_adaptive_resume_limits']=state['pending_stopping']['step_limits']
+        assembly['_local_plot_counter']=int(assembly.get('_local_plot_counter',0))+1
+        if reuse and not s['plot_reused_records']:
+            local_params['plot_save_interval']=10**15
+            local_params['local_spectral_diagnostics_enabled']=False
+        grid_before=simulation.grid_handler.spatial_axis.copy()
+        result=functions['local_refine_waveform'](outfile_name=f'{outfile_name}_rec_n_{int(assembly["rec_n"])}',
+            params=local_params,assembly_dict=assembly,simulation=simulation,stf_handler=stf_handler)
+        simulation=result.get('simulation_handler')
+        if simulation is None:raise RuntimeError('Adaptive local pass did not return a simulation.')
+        if continuing:
+            simulation.local_inversion_history,_=merge_iteration_history(previous_history,simulation.local_inversion_history)
+        if not reuse:
+            optimized+=1
+            limits=(simulation.local_stop_diagnostics or {}).get('step_limits')
+            if limits:state['last_step_limits']=deepcopy(limits)
+            state['gate_confirmation_count']=0
+            threshold,calibration=_reference_threshold(observed,position,paired_rows,observed_waveform_data,
+                state['signal_mask'],state['noise_mask'],float(params.get('local_objective_taper_fraction',0.)),s)
+            state.update(reference_observed=observed.copy(),reference_position=position,reference_rec_n=int(assembly['rec_n']),
+                reference_idx_wave=int(row.uw_idx),reference_time_s=float(row.time_s),reference_threshold=threshold,
+                reference_calibration=calibration,
+                reference_stop_reason=(simulation.local_stop_diagnostics or {}).get('reason','budget_exhausted'))
+            stopping=simulation.local_stop_diagnostics or {}
+            state['reference_ready']=bool(stopping.get('converged',state['reference_stop_reason']!='budget_exhausted'))
+        else:reused+=1
+        action='first_reference' if first else ('reused' if reuse else 'updated')
+        pending=not reuse and not state['reference_ready'] and s['require_verified_reference']
+        if pending:
+            state.update(pending_position=position,pending_is_first=first,pending_stopping=deepcopy(simulation.local_stop_diagnostics),
+                pending_decision=deepcopy(decision),pending_gate_reference_observed=deepcopy(gate_reference),
+                pending_gate_reference_rec_n=gate_reference_rec,pending_gate_reference_time_s=gate_reference_time)
+            buffer=io.BytesIO()
+            payload=_write_row(functions,buffer,simulation,assembly,result,state,action+'_pending',decision,grid_before)
+            path=_pending_path(stream.name);_save_pending(path,payload)
+            print(f'Adaptive paused: rec_n={assembly["rec_n"]} exhausted its iteration budget while still unconverged. '
+                  f'Pending checkpoint: {path}. Relaunch to continue the same waveform.',flush=True)
+            return
+        for key in ('pending_position','pending_is_first','pending_stopping','pending_decision',
+                    'pending_gate_reference_observed','pending_gate_reference_rec_n','pending_gate_reference_time_s'):
+            state.pop(key,None)
+        _write_row(functions,stream,simulation,assembly,result,state,action,decision,grid_before)
+        if hasattr(stream,'name'):
+            pending_file=_pending_path(stream.name)
+            if pending_file.exists():pending_file.unlink()
+        reason=('waiting for a second moderate change' if decision.get('gate_status')=='awaiting_confirmation'
+                else 'noise-compatible model reuse') if reuse else (simulation.local_stop_diagnostics or {}).get('reason','budget_exhausted')
+        print(f'Adaptive {position+1}/{len(paired_rows)}: rec_n={assembly["rec_n"]}, reference={state["reference_rec_n"]}, '
+              f'J={simulation.misfit:.6g}, {reason}',flush=True)
+    print(f'Adaptive completed: {optimized} optimized records, {reused} reused records in this pass.',flush=True)
+
+
+def resume_sequence(functions,*,existing_rows,results_pkl,paired_rows,observed_waveform_data,
+                    waveform_metadata,outfile_name,params,assembly_dict,stf_handler,truncate_to=None):
+    validate(params)
+    globals_=[r for r in existing_rows if 'global_best_misfit' in r]
+    if len(globals_)!=1:raise ValueError('Adaptive resume needs one global-search checkpoint.')
+    global_row=globals_[0]
+    fingerprint=_digest(functions,paired_rows,waveform_metadata,stf_handler,params,observed_waveform_data)
+    if global_row.get('adaptive_configuration_fingerprint')!=fingerprint:
+        raise ValueError('This pickle belongs to a legacy run or a different adaptive configuration. Use a new output folder; it is not modified.')
+    positions={int(r.uw_idx):i for i,r in enumerate(paired_rows)}
+    anchor=positions[int(global_row['idx_wave'])]
+    local=[r for r in existing_rows if 'global_best_misfit' not in r]
+    completed=[]
+    for r in local:
+        if 'adaptive_state' not in r:raise ValueError('Legacy and adaptive local records cannot be mixed.')
+        completed.append(positions[int(r['idx_wave'])])
+    if completed!=list(range(anchor,anchor+len(completed))):
+        raise ValueError('Adaptive pickle must contain one chronological prefix without duplicates or gaps.')
+    saved=local[-1] if local else global_row
+    saved_position=completed[-1] if completed else anchor
+    start=anchor+len(completed)
+    pending_file=_pending_path(results_pkl)
+    if pending_file.exists():
+        with pending_file.open('rb') as f:pending=pickle.load(f)
+        pending_position=positions[int(pending['idx_wave'])]
+        if pending['adaptive_state']['fingerprint']!=fingerprint:raise ValueError('Pending adaptive criteria changed; resume refused.')
+        if pending_position==start:
+            saved=pending;saved_position=pending_position
+        elif pending_position>start:
+            raise ValueError('Pending adaptive checkpoint is not the next selected waveform.')
+    saved_state=saved.get('adaptive_state') or {}
+    if (local and optimizer_settings(params)['enabled'] and saved_state.get('optimization_revision')!=3
+            and not (saved_state.get('pending_is_first') and saved_state.get('pending_position')==anchor)):
+        return _finish_legacy_reference_in_branch(functions,global_row=global_row,results_pkl=results_pkl,
+            paired_rows=paired_rows,observed_waveform_data=observed_waveform_data,waveform_metadata=waveform_metadata,
+            outfile_name=outfile_name,params=params,assembly_dict=assembly_dict,stf_handler=stf_handler)
+    _,simulation=functions['_rebuild_simulation_from_saved_row'](saved_row=global_row,global_row=global_row,
+        paired_row=paired_rows[anchor],observed_waveform_data=observed_waveform_data,waveform_metadata=waveform_metadata,
+        stf_handler=stf_handler,params=params,base_assembly=assembly_dict)
+    stored=saved.get('local_continuation_state',saved.get('optimizer_reference_seed',saved.get('global_continuation_state')))
+    if stored is None or 'restart_runtime' not in stored:raise ValueError('Adaptive resume requires a complete runtime checkpoint.')
+    assembly=functions['_restore_local_continuation_state'](simulation,stored)
+    observed=np.asarray(observed_waveform_data[int(paired_rows[saved_position].uw_idx)])
+    _restore_runtime(simulation,stored,observed,np.asarray(waveform_metadata['time_ax_waveform']))
+    if not hasattr(simulation,'_kinematic_reference'):
+        # Legacy local profiles are NOT a homogeneous reference: use the global checkpoint.
+        try:
+            reference=reference_from_state(global_row['global_continuation_state'])
+        except ValueError as error:
+            reference={'schema':1,'unavailable_reason':str(error)}
+        ensure_reference(simulation,reference)
+    state=deepcopy(saved.get('adaptive_state'))
+    if state is not None and 'last_step_limits' not in state:
+        limits=(saved.get('local_stopping') or {}).get('step_limits')
+        if not limits:
+            for previous in reversed(local):
+                limits=previous.get('_retained_step_limits') or (previous.get('local_stopping') or {}).get('step_limits')
+                if limits:break
+        if limits:state['last_step_limits']=deepcopy(limits)
+    if state is not None:
+        _adopt_policy(state,settings(params))
+        previous_optimizer=state.get('optimization_policy_fingerprint')
+        _adopt_optimizer_policy(state,params)
+        reference=np.asarray(observed_waveform_data[state['reference_idx_wave']])
+        if not np.array_equal(reference,state['reference_observed']):raise ValueError('Saved reference observation changed; resume refused.')
+        if previous_optimizer is not None and previous_optimizer!=state['optimization_policy_fingerprint']:
+            # Keep the unmodified continuation before the next pass overwrites it.
+            contents=pending_file.read_bytes()
+            backup=pending_file.with_name(pending_file.name+'.before_policy_'+hashlib.sha256(contents).hexdigest()[:12]+'.bak')
+            if not backup.exists():backup.write_bytes(contents)
+            elif backup.read_bytes()!=contents:raise ValueError('Conflicting pending checkpoint backup.')
+            print(f'Adaptive previous pending checkpoint retained at {backup}.',flush=True)
+    if truncate_to is not None:
+        path=Path(results_pkl)
+        with path.open('rb') as f:f.seek(truncate_to);tail=f.read()
+        backup=path.with_name(path.name+'.incomplete_tail_'+hashlib.sha256(tail).hexdigest()[:12]+'.bak')
+        if not backup.exists():backup.write_bytes(tail)
+        with path.open('r+b') as f:f.truncate(truncate_to)
+        print(f'Adaptive resume: incomplete tail backed up to {backup.name}.',flush=True)
+    if start>=len(paired_rows):
+        print('Adaptive resume: all selected records already saved.',flush=True);return
+    with Path(results_pkl).open('ab') as stream:
+        run_sequence(functions,paired_rows=paired_rows,start_position=start,observed_waveform_data=observed_waveform_data,
+            waveform_metadata=waveform_metadata,outfile_name=outfile_name,params=params,assembly=assembly,
+            simulation=simulation,stf_handler=stf_handler,stream=stream,state=state)
+
+
+def resume_file(functions,**kwargs):
+    """Keep only small progress metadata and the last full checkpoint in memory."""
+    if settings(kwargs['params'])['mode']=='independent':
+        from .adaptive_independent import resume_file as resume_independent
+        return resume_independent(functions,**kwargs)
+    path=Path(kwargs['results_pkl']);rows=[];last=None;end=0;truncate=None
+    with path.open('rb') as stream:
+        size=path.stat().st_size
+        while stream.tell()<size:
+            start=stream.tell()
+            try:row=pickle.load(stream)
+            except EOFError:truncate=end;break
+            except pickle.UnpicklingError as error:
+                if 'truncated' in str(error).lower():truncate=end;break
+                raise
+            end=stream.tell()
+            if 'global_best_misfit' in row:
+                if last is not None:raise ValueError('A global row appears after local rows; adaptive stream is invalid.')
+                rows.append(row)
+            else:
+                if last is not None:
+                    rows[-1]={'idx_wave':last['idx_wave'],'adaptive_state':{} if 'adaptive_state' in last else None,
+                              '_retained_step_limits':deepcopy((last.get('local_stopping') or {}).get('step_limits'))}
+                rows.append(row);last=row
+    # A None marker denotes a legacy local checkpoint and must not be upgraded silently.
+    if any(r.get('adaptive_state',1) is None for r in rows):
+        raise ValueError('Legacy local records found. Use a new output folder for adaptive inversion.')
+    resume_sequence(functions,existing_rows=rows,truncate_to=truncate,**kwargs)
+
+
+def annotate_global(functions,row,paired_rows,waveform_metadata,stf,params,observed_waveform_data):
+    if enabled(params):row['adaptive_configuration_fingerprint']=_digest(functions,paired_rows,waveform_metadata,stf,params,observed_waveform_data)
+
+
+def write_summary(functions,results_pkl,params):
+    """Do not request gouge-summary plots before the first reference is complete."""
+    if not enabled(params):return functions['_write_local_summary_plots'](results_pkl,params)
+    branch=Path(results_pkl).parent/'optimizer_v3'/Path(results_pkl).name
+    if Path(results_pkl).parent.name!='optimizer_v3' and branch.is_file() and optimizer_settings(params)['enabled']:
+        branch_params=dict(params);branch_params['outdir_path_image']=Path(params['outdir_path_image'])/'optimizer_v3'
+        branch_params['outdir_path_l2norm']=branch.parent
+        return write_summary(functions,branch,branch_params)
+    found=False
+    with Path(results_pkl).open('rb') as f:
+        while True:
+            try:row=pickle.load(f)
+            except EOFError:break
+            if 'global_best_misfit' not in row and 'gouge_1_velocity' in row:
+                found=True;break
+    if found:functions['_write_local_summary_plots'](results_pkl,params)
+    else:print('Adaptive summary deferred: no completed local records yet.',flush=True)

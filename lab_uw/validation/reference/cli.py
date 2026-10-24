@@ -38,6 +38,7 @@ from lab_uw.validation.reference.manifest import (
 
 
 DEFAULT_OPTIONS = {
+    "source_duration_us": None,  # STEEL_REFERENCE_AMPLITUDE_V1
     "stf_name": None,
     "channel_name": None,
     "average_waveforms": True,
@@ -105,7 +106,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--filter-order", type=int)
     parser.add_argument(
         "--wavelet-filter-mode",
-        choices=("already_filtered", "apply"),
+        choices=("already_filtered", "apply", "from_tsv"),
     )
     parser.add_argument("--number-of-waveforms", type=int)
     parser.add_argument(
@@ -170,6 +171,8 @@ def _parser() -> argparse.ArgumentParser:
         nargs="+",
         help="Optional PPW levels, e.g. 10 15 20 30; compares the direct packet.",
     )
+    parser.add_argument("--source-duration-us", type=float,
+        help="Crop the source BEFORE fitting its steel-reference gain; export PREFIX.source.npz for the DDS.")
     return parser
 
 
@@ -287,6 +290,10 @@ def _run_one(args: argparse.Namespace, *, provenance: Optional[dict] = None) -> 
         spatial_boundary_mode=args.spatial_boundary_mode,
         source_amplitude=args.source_amplitude,
     )
+    # STEEL_REFERENCE_AMPLITUDE_V1
+    if args.source_duration_us is not None:
+        from lab_uw.source_amplitude import truncate_case
+        case = truncate_case(case, args.source_duration_us)
     result = run_reference_forward(case, geometry, config)
     validation_orders = reliable_packet_orders(
         case.calibration,
@@ -345,6 +352,19 @@ def _run_one(args: argparse.Namespace, *, provenance: Optional[dict] = None) -> 
             "negative_correlation": "treated as zero similarity",
         },
     }
+    # STEEL_REFERENCE_AMPLITUDE_V1
+    if args.source_duration_us is not None:
+        from lab_uw.source_amplitude import export_reference_source
+        source_path = args.output_prefix.with_suffix(".source.npz")
+        calibration = export_reference_source(source_path, case=case, geometry=geometry,
+            config=config, score=score, provenance={
+                "validation": provenance, "filter_order": args.filter_order,
+                "tsv": str(args.tsv), "stf_h5": str(args.stf_h5),
+                "calibration_json": str(args.calibration_json)})
+        payload["exported_source"] = {"path": str(source_path), "id": calibration["id"],
+            "reference_gain": calibration["reference_gain"],
+            "duration_us": calibration["duration_us"], "dds_trace_scale": 1.0}
+        print(f"calibrated source: {source_path} (gain={calibration['reference_gain']:.9g})")
     with json_path.open("w", encoding="utf-8") as stream:
         json.dump(payload, stream, indent=2)
     _save_plot(

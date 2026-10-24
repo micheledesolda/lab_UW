@@ -891,6 +891,13 @@ def _build_local_result_row(
     # KINEMATIC_VELOCITY_LABEL_V1
     from lab_uw.kinematic_velocity import result_fields
     result_row.update(result_fields(simulation))
+    # LOCAL_MATERIAL_COORDINATES_V1_RESULT
+    from lab_uw.material_parameters import annotate_result
+    annotate_result(result_row, simulation)
+    from lab_uw.source_amplitude import annotate_source
+    annotate_source(result_row, getattr(simulation, "stf_handler", None))
+    from lab_uw.adaptive_reuse import annotate_result as annotate_reuse
+    annotate_reuse(result_row, simulation)
     return result_row
 
 
@@ -932,8 +939,10 @@ def _capture_local_continuation_state(
     simulation_attributes = {}
     for attribute_name in (
         "synthetic_waveform",
+        "model_reuse_diagnostics",
         "trace_scale",
         "reference_trace_scale",
+        "source_calibration",
         "misfit",
         "average_gouge_velocity",
         "average_gouge_damping",
@@ -941,6 +950,8 @@ def _capture_local_continuation_state(
         "local_update_strategy",
         "local_inversion_history",
         "amplitude_scale_mode",
+        "local_density_inverted",
+        "local_density_bounds_g_cm3",
         "spectral_gamma",
         "objective_taper_fraction",
         'kinematic_velocity_m_s',
@@ -981,6 +992,10 @@ def _restore_local_continuation_state(
     continuation_state: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Restore a compact lane checkpoint into a fresh worker-local model."""
+
+    from lab_uw.source_amplitude import require_checkpoint_source
+    require_checkpoint_source(simulation, continuation_state)
+
 
     simulation.grid_handler.spatial_axis = continuation_state[
         "grid_spatial_axis"
@@ -1611,6 +1626,11 @@ def _rebuild_simulation_from_saved_row(
     base_assembly: Dict[str, Any],
 ) -> tuple[Dict[str, Any], UltrasonicModeler]:
     """Rebuild a lightweight modeler and inject a legacy saved model."""
+
+    from lab_uw.source_amplitude import require_saved_source
+    require_saved_source(global_row, stf_handler)
+    require_saved_source(saved_row, stf_handler)
+
 
     if global_row.get("teeth_bank_metadata") is not None or global_row.get("teeth_continuous_metadata") is not None:
         raise NotImplementedError(
@@ -2263,10 +2283,9 @@ def process_uw_file(
                 if not result_global.get("simulation_handler", None):
                     continue
 
-                # The global stage is allowed to profile one unknown scalar
-                # amplitude.  Its final value calibrates the otherwise
-                # arbitrary STF/source/receiver units once for the complete
-                # experiment; local inversions must not refit it per record.
+                # Keep the global scale as checkpoint metadata. Local runs
+                # profile their own scale for each waveform and trial model;
+                # reference_trace_scale is not imposed on local inversion.
                 sim_g = result_global["simulation_handler"]
                 reference_trace_scale = float(sim_g.trace_scale)
                 if not np.isfinite(reference_trace_scale) or reference_trace_scale <= 0.0:
@@ -2647,6 +2666,9 @@ def process_uw_file(
                     params.get("local_records_per_worker", 3)
                 )
 
+                # STEEL_REFERENCE_AMPLITUDE_V1
+                from lab_uw.source_amplitude import annotate_source
+                annotate_source(global_row, stf_handler)
                 annotate_global(globals(), global_row, paired_rows, waveform_metadata, stf_handler, params, observed_waveform_data)
                 results_summary.append(global_row)
                 results_by_rec_n[rec_n] = global_row
@@ -3863,9 +3885,8 @@ def search_common_gouge_density(
     candidates = np.unique(requested)
     output_dir = plot_output_path / "density_search"
     output_dir.mkdir(parents=True, exist_ok=True)
-    # Use the same complete direct-arrival interval used by the homogeneous
-    # c/damping search.  A pre-echo amplitude fit would make the two objective
-    # values incomparable and would over-weight later reverberations.
+    # Keep the same complete direct-arrival interval as the homogeneous grid.
+    # Fit one scalar on this full window, consistently with the other grids.
     normalization_interval = misfit_interval
     plot_all = bool(params.get("density_search_plot_all", False)) and save_plot
     args_list = [
@@ -4007,9 +4028,8 @@ def impedance_material_search_run(args) -> Dict[str, float]:
         frequency_cutoff=params["frequency_cutoff"],
         assembly_dict=candidate,
         misfit_interval=misfit_interval,
-        # This is deliberately identical to the scoring interval: every
-        # candidate receives one least-squares amplitude factor over the full
-        # direct packet, including its internal reverberations.
+        # Fit one scalar over the same complete packet used for scoring.
+        # The effective wavelet shape is unchanged.
         normalization_interval=misfit_interval,
         minimum_velocity=minimum_velocity,
         maximum_velocity=maximum_velocity,
@@ -4041,6 +4061,10 @@ def impedance_material_search_run(args) -> Dict[str, float]:
         "spectral_shape_distance": float(
             spectral["recorded_vs_simulated_distance"]
         ),
+        "trace_scale": float(simulation.trace_scale),
+        "amplitude_ratio": float(simulation.objective_components["amplitude_ratio"]),
+        "amplitude_misfit": float(simulation.objective_components["amplitude_misfit"]),
+        "amplitude_scale_mode": ("fixed_steel_reference" if getattr(simulation, "source_calibration", None) else ("profiled_per_candidate" if simulation.normalize_waveform else "none")),
     }
 
 
@@ -4139,45 +4163,13 @@ def _profiled_material_metric(
 
 
 def _plot_profiled_material_results(
-    results: list[Dict[str, float]],
-    *,
-    metric_key: str,
-    metric_label: str,
-    output_path: Path,
-    elastic_only: bool = False,
-) -> None:
-    projections = (
-        ("gouge_velocity", "gouge_density_g_cm3", r"$c_g$ [m/s]", r"$\rho_g$ [g/cm$^3$]"),
-        ("gouge_damping", "gouge_density_g_cm3", r"$\nu_g$", r"$\rho_g$ [g/cm$^3$]"),
-        ("gouge_velocity", "gouge_damping", r"$c_g$ [m/s]", r"$\nu_g$"),
-    )
-    if elastic_only:
-        # Damping is fixed, so only the c/rho plane is a search dimension.
-        projections = projections[:1]
-    best = min(results, key=lambda item: item[metric_key])
-    fig, axes = plt.subplots(
-        1, len(projections), figsize=(5 * len(projections), 4.5),
-        constrained_layout=True,
-    )
-    for axis, (x_key, y_key, x_label, y_label) in zip(np.atleast_1d(axes), projections):
-        x_values, y_values, grid = _profiled_material_metric(
-            results, x_key=x_key, y_key=y_key, metric_key=metric_key
-        )
-        x_scale = 1.0e4 if x_key == "gouge_velocity" else 1.0
-        image = axis.pcolormesh(x_scale * x_values, y_values, grid, shading="auto")
-        axis.scatter(
-            x_scale * best[x_key], best[y_key], marker="*", s=130, color="white",
-            edgecolor="black", linewidth=0.7, zorder=3,
-        )
-        axis.set_xlabel(x_label)
-        axis.set_ylabel(y_label)
-        axis.grid(alpha=0.15)
-        fig.colorbar(image, ax=axis, label=metric_label)
-    model_label = "Elastic material search (nu=0)" if elastic_only else "Profiled joint material search"
-    fig.suptitle(f"{model_label}: {metric_label}")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=200)
-    plt.close(fig)
+    results, *, metric_key, metric_label, output_path, elastic_only=False,
+):
+    # PROFILED_CONSTITUTIVE_MAPS_V1
+    from lab_uw.material_search_maps import plot_material_maps
+    modes = sorted({str(r.get("amplitude_scale_mode", "not_recorded")) for r in results})
+    return plot_material_maps(results, metric_key=metric_key, metric_label=metric_label,
+        output_path=output_path, elastic_only=elastic_only, scale_policy="; ".join(modes))
 
 
 def _parameter_bounds(
@@ -4215,7 +4207,7 @@ def search_joint_impedance_material(
 
     ``elastic`` fixes nu=0 everywhere. The same propagation kernel then
     solves rho*u_tt = d_x(rho*c**2*u_x) + rho*f*s, with the same boundary,
-    source, receiver, direct window and trace-scale fitting conventions.
+    source, receiver, direct window and per-candidate trace-scale conventions.
     This file currently implements one grid stage, labelled ``coarse``.
     """
 
@@ -4328,7 +4320,10 @@ def search_joint_impedance_material(
         f"damping={impedance_best['gouge_damping']:.6f}, "
         f"rho_g={impedance_best['gouge_density_g_cm3']:.3f} g/cm^3, "
         f"J_gamma={best_simulation.misfit:.3f}, "
-        f"D_f={best_spectral['recorded_vs_simulated_distance']:.4f}"
+        f"D_f={best_spectral['recorded_vs_simulated_distance']:.4f}; "
+        f"source_amplitude={params['source_receiver_config'].get('source_amplitude', 1.0):g}, "
+        f"trace_scale={best_simulation.trace_scale:g}, "
+        f"normalize_waveform={best_simulation.normalize_waveform}"
     )
     return {
         "material_model": material_model,
@@ -4405,7 +4400,7 @@ def _compare_elastic_kelvin_voigt(
         axis.plot(time, elastic_sim.synthetic_waveform[mask], label=f"Elastic, nu=0: J={elastic_sim.misfit:.4g}")
         axis.plot(time, kv_sim.synthetic_waveform[mask], label=f"Kelvin-Voigt: J={kv_sim.misfit:.4g}")
         axis.set_xlabel("Time [us]")
-        axis.set_ylabel("Amplitude (fitted trace scale)")
+        axis.set_ylabel("Amplitude")
         axis.set_title("Best homogeneous physical-density models: direct arrival")
         axis.grid(alpha=0.2)
         axis.legend()
@@ -4972,6 +4967,12 @@ def local_refine_waveform(
     Does not change I/O of forward_simulation or run_local_inversion; it only sets initial model arrays.
     """
 
+    # ADAPTIVE_REUSE_WITHOUT_FORWARD_V1
+    if params.get("_adaptive_reuse", False):
+        from lab_uw.adaptive_reuse import reuse_without_forward
+        return reuse_without_forward(simulation, assembly_dict, params)
+    simulation.model_reuse_diagnostics = None
+
     plot_save_interval = params["plot_save_interval"]
     movie_save_interval = params["movie_save_interval"]
     outdir_path_image = params["outdir_path_image"]
@@ -5062,9 +5063,8 @@ def local_refine_waveform(
         ds_threshold         = ds_threshold,
         reduce_factor        = params["reduce_factor"],
         misfit_threshold     = float(params.get("local_misfit_threshold", 1.0e-8)),
-        normalize_waveform   = False,
-        amplitude_scale_mode = "fixed",
-        fixed_trace_scale    = float(simulation.reference_trace_scale),
+        normalize_waveform   = True,
+        amplitude_scale_mode = "profiled",
         spectral_gamma       = float(params.get("local_spectral_gamma", 1.0)),
         objective_taper_fraction=float(
             params.get("local_objective_taper_fraction", 0.0)
@@ -5148,8 +5148,8 @@ if __name__ == "__main__":
         '_s': {
             'velocity_values_cm_us': np.linspace(0.1100, 0.1500, 16),
             'impedance_velocity_values_cm_us': np.linspace(0.1100, 0.1500, 16),
-            'damping_values_cm2_us': np.linspace(0.000,0.0005, 20),
-            'impedance_damping_values_cm2_us': np.linspace(0.000,0.0005, 20),
+            'damping_values_cm2_us': np.linspace(0.000,0.0005, 15),
+            'impedance_damping_values_cm2_us': np.linspace(0.000,0.0005, 15),
             'minimum_velocity_cm_us': 0.08,
             'maximum_velocity_cm_us': 0.33,
             'waveform_duration_us': 25,
@@ -5164,10 +5164,10 @@ if __name__ == "__main__":
             'uw_basename': '006_reload_ss_1_S',  # None: tutti i file
         },
         '_p': {
-            'velocity_values_cm_us': np.linspace(0.1600, 0.2000, 20),
-            'impedance_velocity_values_cm_us': np.linspace(0.1600, 0.2000, 20),
-            'damping_values_cm2_us': np.linspace(0.0005, 0.0009, 20),
-            'impedance_damping_values_cm2_us': np.linspace(0.0005, 0.0009, 20),
+            'velocity_values_cm_us': np.linspace(0.1600, 0.2000, 15),
+            'impedance_velocity_values_cm_us': np.linspace(0.1600, 0.2000, 15),
+            'damping_values_cm2_us': np.linspace(0.0005, 0.0009, 15),
+            'impedance_damping_values_cm2_us': np.linspace(0.0005, 0.0009, 15),
             'minimum_velocity_cm_us': 0.15,
             'maximum_velocity_cm_us': 0.62,
             'waveform_duration_us': 16,
@@ -5182,10 +5182,14 @@ if __name__ == "__main__":
             'uw_basename': '005_reload_ss_1_P',  # None: tutti i file
         },
     }
+    # STEEL_REFERENCE_AMPLITUDE_V1
+    # Set one path for each polarization; None retains the previous workflow.
+    polarization_settings['_p'].setdefault('calibrated_source_path', None)
+    polarization_settings['_s'].setdefault('calibrated_source_path', None)
     polarization = validate_polarization(wave_type, polarization_settings)
     selected_uw_basename = polarization['uw_basename']
     mechanical_selection = {
-        'enabled': True,
+        'enabled': False,
         'time_interval_s': None,  # None: scegli sul grafico la prima volta
         'reselect': False,  # True: scegli nuovamente il tratto
         'selection_file': (dir_manager.paths.analysis_root(machine_name, experiment_name)
@@ -5196,7 +5200,16 @@ if __name__ == "__main__":
     data_type_uw    = "uw_data/data_tsv_files" + wave_type
     data_type_mech  = "mechanical_data"
     mech_file_name  = f"{experiment_name}_data_rp"
-    outfolder_name  = "test_2026-10-16_gamma0_gamma1_joint_p_6MHz_adaptive_noise_SNR_3_charge_and_3_ss_last"
+    # PROFILED_SOURCE_AMPLITUDE_V1
+    # La scala viene adattata sui dati per ogni modello globale/locale.
+    # Il moltiplicatore di partenza puo rimanere uno.
+    source_amplitude = 1.0
+    if not np.isfinite(source_amplitude) or source_amplitude <= 0.0:
+        raise ValueError("source_amplitude deve essere finita e positiva")
+    outfolder_name  = "test_2026-10-23_gamma1_gamma1_joint_adaptive_noise_SNR_3_run_in_FULL"
+    outfolder_name += "_density_local"
+    outfolder_name += "_profiled_amp_global_local"
+
     # Create output directories
     outdir_path_l2norm = dir_manager.make_data_analysis_folders(
         machine_name    = machine_name,
@@ -5305,12 +5318,12 @@ if __name__ == "__main__":
             "blas_threads": 1,
             "cache_materials": 1,
             "full_refinement_top_k": 3,
-            "plot_all_candidates": True,
+            "plot_all_candidates": False,
         },
         "impedance_points_per_wavelength": 8,
         "impedance_velocity_values_cm_us": polarization['impedance_velocity_values_cm_us'],
         "impedance_damping_values": polarization['impedance_damping_values_cm2_us'],
-        "impedance_density_values_g_cm3": np.linspace(1.8, 2.5, 20),
+        "impedance_density_values_g_cm3": np.linspace(1.8, 2.9, 12),
         # Once the common material is fixed, redistribute only the measured
         # total gouge thickness.  With c1=c2 this cannot alter the direct
         # travel time; it tests only the relative timing of internal echoes.
@@ -5338,13 +5351,13 @@ if __name__ == "__main__":
         "local_velocity_step_threshold_fraction": 0.01,
         "local_damping_step_fraction": 0.05,
         "local_damping_step_threshold_fraction": 0.01,
-        # The final global trace scale is calibrated once on the first record
-        # and then held fixed.  gamma=1 is exactly the relative L2 objective;
+        # Global and local candidates each fit one amplitude scalar.
+        # gamma=1 is the relative L2 objective, required by local profiling;
         # larger values explicitly upweight spectral-energy shape.
         "local_spectral_gamma": 1.0,
         # All three global grids use the same complete J_gamma objective.
         # Omit these keys to inherit the corresponding local settings.
-        "global_spectral_gamma": 0.0,
+        "global_spectral_gamma": 1.0,
         "global_objective_taper_fraction": 0.0,
         "local_objective_taper_fraction": 0.0,
         "local_misfit_threshold": 1.0e-2,
@@ -5382,7 +5395,12 @@ if __name__ == "__main__":
         "side2_density_g_cm3": 7.85,
     }
 
-    params.setdefault("local_optimizer", {})["minimum_gain_absolute"] = 1e-5
+    # LOCAL_DENSITY_INVERSION_V1
+    params.setdefault("local_optimizer", {}).setdefault("invert_density", True)
+    # None: usa gli estremi di impedance_density_values_g_cm3 (o gouge_density_values_g_cm3).
+    params["local_optimizer"].setdefault("density_bounds_g_cm3", None)
+
+    params.setdefault("local_optimizer", {})["minimum_gain_absolute"] = 1e-4
     params.setdefault("adaptive_inversion", {}).update({
     "gate_noise_factor": 0.75,
     "gate_confirm_records": 1,
@@ -5409,6 +5427,10 @@ if __name__ == "__main__":
         'require_verified_reference': True,
     }
 
+    # LOCAL_MATERIAL_COORDINATES_V1_CONFIG
+    # Ingressi e grafici restano in velocita e damping; densita fissa nel locale.
+    params.setdefault("local_optimizer", {}).setdefault("parameterization", 'modulus_viscosity')
+
     # ADAPTIVE_INDEPENDENT_CONFIGURATION_V1
     # Ogni onda parte dallo stesso modello della prima acquisizione.
     params["adaptive_inversion"].setdefault("mode", "independent")
@@ -5426,8 +5448,8 @@ if __name__ == "__main__":
 
     # MECHANICAL_SELECTION_VISUAL_CONFIG_V1
     params["mechanical_selection_inspection"] = {
-        "enabled": False,
-        "only": False,  # True: salva le figure e termina prima dell'inversione
+        "enabled": True,
+        "only": True,  # True: salva le figure e termina prima dell'inversione
         "script_path": None,  # None: visual_ispection_standard.py accanto a questo file
         "window_us": None,  # None: stessa finestra iniziale dell'inversione
         "save_pdf": False,
@@ -5454,6 +5476,12 @@ if __name__ == "__main__":
         'misfit_interval_us': None,  # solo per vecchi checkpoint senza finestra recuperabile
     }
 
+    # Scala adattata sui dati nel globale e nel locale; riattiva le inversioni.
+    params["source_receiver_config"]["source_amplitude"] = source_amplitude
+    params["global_spectral_gamma"] = 1.0
+    params["local_spectral_gamma"] = 1.0
+    params["run_local_inversion"] = True
+
     # Load the Source Time Function (HDF5)
     stf_h5_path = (
         (Path(polarization['stf_h5_path']).expanduser()
@@ -5463,14 +5491,23 @@ if __name__ == "__main__":
     )
 
     # read the STF saved under /stf/width250_volt70/cycle_000000/source_waveform
-    stf_handler = UltrasonicDataHandler.read_stf_hdf5(
-        stf_h5_path,
-        name=polarization['stf_name'],   # "width250_volt70_local_inversion" when available
-        cycle_index=polarization['stf_cycle_index'],
-    )
+    # STEEL_REFERENCE_AMPLITUDE_V1
+    if polarization.get('calibrated_source_path'):
+        from lab_uw.source_amplitude import load_source
+        stf_handler = load_source(polarization['calibrated_source_path'],
+            expected_wave_type=wave_type, frequency_min=params['frequency_min'],
+            frequency_max=params['frequency_cutoff'])
+        _source_meta = stf_handler.metadata['source_calibration']
+        print(f"Steel reference: {_source_meta['reference_case']}, gain={_source_meta['reference_gain']:.9g}; DDS trace_scale=1 fixed")
+    else:
+        stf_handler = UltrasonicDataHandler.read_stf_hdf5(
+            stf_h5_path,
+            name=polarization['stf_name'],   # "width250_volt70_local_inversion" when available
+            cycle_index=polarization['stf_cycle_index'],
+        )
 
-    ########### HO MESSO UN TRONCAMENTO ARBITRATIO A 4 MUS #####################
-    stf_handler.waveform_data = stf_handler.truncate_time(polarization['stf_truncate_us']).waveform_data.squeeze(0)   # shape (L,) e c'e' anche un troncamento
+        ########### HO MESSO UN TRONCAMENTO ARBITRATIO A 4 MUS #####################
+        stf_handler.waveform_data = stf_handler.truncate_time(polarization['stf_truncate_us']).waveform_data.squeeze(0)   # shape (L,) e c'e' anche un troncamento
     # plt.plot(stf_handler.metadata['time_ax_waveform'], stf_handler.waveform_data)
     # plt.show()
     # sys.exit()
@@ -5531,17 +5568,23 @@ if __name__ == "__main__":
                                                        num_waveform2process=preprocessing_waveform_count(params))
 
         # Load & process ultrasonic data and metadata from TSV, with preprocessing
-        uw_data_handler = (
-            UltrasonicDataHandler.read_tsv(infile_path)
-                .remove_mean()
-                .downsample_waveforms(preprocessing_waveform_count(params))     # keep N waveforms (evenly sampled)
-                .truncate_time(params["maxtime2simulate"])                # limit to maxtime [µs]
-                .zero_before(assembly_dict["steel_only_time_wave"] / 5) # zero early window [µs]
-                .bandpass(
-                    freqmin=params["frequency_min"],
-                    freqmax=params["frequency_cutoff"],
-                )
-        )
+        # STEEL_REFERENCE_AMPLITUDE_V1
+        if stf_handler.metadata.get('source_calibration') is not None:
+            uw_data_handler = (
+                UltrasonicDataHandler.read_tsv(infile_path).remove_mean().downsample_waveforms(preprocessing_waveform_count(params)).bandpass(freqmin=params['frequency_min'], freqmax=params['frequency_cutoff'], order=int(stf_handler.metadata['source_calibration'].get('filter_order') or 4)).truncate_time(params['maxtime2simulate']).zero_before(assembly_dict['steel_only_time_wave'] / 5)
+            )
+        else:
+            uw_data_handler = (
+                UltrasonicDataHandler.read_tsv(infile_path)
+                    .remove_mean()
+                    .downsample_waveforms(preprocessing_waveform_count(params))     # keep N waveforms (evenly sampled)
+                    .truncate_time(params["maxtime2simulate"])                # limit to maxtime [µs]
+                    .zero_before(assembly_dict["steel_only_time_wave"] / 5) # zero early window [µs]
+                    .bandpass(
+                        freqmin=params["frequency_min"],
+                        freqmax=params["frequency_cutoff"],
+                    )
+            )
 
  
         # # Diagnostica sincronizzazione: stampa solo pochi numeri

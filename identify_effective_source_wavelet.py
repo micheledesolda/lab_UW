@@ -619,7 +619,7 @@ def main():
     search_margin = 1    # [mus] +/- interval search around the user pick
     step_size = 0.01     # [mus] increments step. At best should be the sampling frequency
     freqmin = 0.1
-    freqmax = 12
+    freqmax = 6.0
     
     dir_manager = DirectoryManager(base_dir=base_dir)
 

@@ -412,6 +412,12 @@ class UltrasonicModeler:
         local inversion and movies still require ``store_wavefield=True``.
         """
 
+        # STEEL_REFERENCE_AMPLITUDE_V1
+        from lab_uw.source_amplitude import bind_forward
+        if bind_forward(self, locals()):
+            normalize_waveform = False
+
+
         if teeth_bank_options is not None and teeth_continuous_options is not None:
             raise ValueError('Choose bank or continuous teeth options, not both')
         if teeth_continuous_options is not None:
@@ -1188,6 +1194,22 @@ class UltrasonicModeler:
         mixed interaction, and accepts only the best improving candidate.
         """
 
+        # STEEL_REFERENCE_AMPLITUDE_V1
+        from lab_uw.source_amplitude import require_unit_scale
+        if getattr(self, "source_calibration", None) is not None:
+            require_unit_scale(self, fixed_trace_scale)
+            amplitude_scale_mode = "fixed"
+            fixed_trace_scale = 1.0
+            normalize_waveform = False
+
+
+        # LOCAL_MATERIAL_COORDINATES_V1
+        from lab_uw.material_parameters import parameterization
+        coordinate_policy = getattr(self, "optimization_policy", None)
+        if coordinate_policy is None and int(n_iterations) == 0:
+            coordinate_policy = {"parameterization": getattr(self, "local_material_parameterization", "velocity_damping")}
+        self.local_material_parameterization = parameterization(coordinate_policy or {})
+
         if self.synthetic_waveform is None:
             raise RuntimeError("No forward-simulation results. Call `forward_simulation()` first.")
         self._require_local_model_adjoint_configuration()
@@ -1195,6 +1217,21 @@ class UltrasonicModeler:
         from lab_uw.kinematic_velocity import ensure_reference, update_model_kinematics, filename_label
         ensure_reference(self)
         use_effective_adjoint = self.embedding_mode == "effective_surface"
+        if self.local_material_parameterization == "modulus_viscosity" and not use_effective_adjoint:
+            raise ValueError("modulus_viscosity requires the matched effective_surface FD/adjoint.")
+        # LOCAL_DENSITY_INVERSION_V1
+        from lab_uw.density_inversion import pure_gouge_indices, density_plot
+        invert_density = bool((getattr(self, "optimization_policy", None) or {}).get("invert_density", False))
+        self.local_density_inverted = invert_density
+        if invert_density and (not use_effective_adjoint or self.geometry_type != "dds"):
+            raise ValueError("Density inversion requires the matched effective_surface DDS forward/adjoint.")
+        if invert_density:
+            self.local_density_bounds_g_cm3 = self.optimization_policy["density_bounds_g_cm3"]
+        fit_local_scale = fit_trace_scale
+        if invert_density:
+            from functools import partial
+            from lab_uw.density_inversion import fit_density_trace_scale
+            fit_local_scale = partial(fit_density_trace_scale, taper_fraction=objective_taper_fraction)
         density_before_shrink = self.velocity_model_handler.density_array.copy()
 
         # A local inversion recomputes its initial forward field from the
@@ -1260,10 +1297,10 @@ class UltrasonicModeler:
         initial_receiver_spatial_function = self.receiver_handler.spatial_function.copy()
         initial_velocity_model = self.velocity_model_handler.velocity_array.copy()
         initial_damping_model = self.velocity_model_handler.damping_array.copy()
-        # Density is part of the forward operator, but is deliberately fixed
-        # during this local inversion.  It comes from the global material
-        # search and is differentiated through, not updated.
+        # Density starts from the carried/global model. It is updated only
+        # when local_optimizer.invert_density is enabled.
         initial_density_model = self.velocity_model_handler.density_array.copy()
+        best_density_model = initial_density_model.copy()
         idx_dict = self.velocity_model_handler.idx_dict
 
         if amplitude_scale_mode is None:
@@ -1325,7 +1362,7 @@ class UltrasonicModeler:
             source_time_function=initial_source_time_function,
             velocity_model=initial_velocity_model,
             damping_model=initial_damping_model,
-            density_model=initial_density_model,
+            density_model=best_density_model,
             absorbing=absorbing,
             boundary_condition=self.boundary_condition,
             boundary_impedance=self.boundary_impedance,
@@ -1340,7 +1377,7 @@ class UltrasonicModeler:
             delta_x=delta_x,
             velocity_model=initial_velocity_model,
             damping_model=initial_damping_model,
-            density_model=initial_density_model,
+            density_model=best_density_model,
         )
         initial_synthetic_waveform = np.interp(
             observed_time,
@@ -1349,7 +1386,7 @@ class UltrasonicModeler:
         )
 
         if amplitude_scale_mode == "profiled":
-            best_trace_scale = fit_trace_scale(
+            best_trace_scale = fit_local_scale(
                 observed_waveform=observed_waveform,
                 synthetic_waveform=initial_synthetic_waveform,
                 misfit_interval=misfit_interval,
@@ -1488,7 +1525,7 @@ class UltrasonicModeler:
                 simulated_waveform,
             )
             if amplitude_scale_mode == "profiled":
-                trace_scale = fit_trace_scale(
+                trace_scale = fit_local_scale(
                     observed_waveform=observed_waveform,
                     synthetic_waveform=synthetic_waveform,
                     misfit_interval=misfit_interval,
@@ -1507,7 +1544,7 @@ class UltrasonicModeler:
             )
             return synthetic_waveform, float(trace_scale), objective
 
-        def _evaluate_receiver_only_candidate(velocity_model, damping_model):
+        def _evaluate_receiver_only_candidate(velocity_model, damping_model, candidate_density=None):
             simulated_waveform = finite_difference_1d_receiver_trace(
                 num_x=num_x,
                 delta_x=delta_x,
@@ -1519,14 +1556,14 @@ class UltrasonicModeler:
                 receiver_quantity=self.receiver_quantity,
                 velocity_model=velocity_model,
                 damping_model=damping_model,
-                density_model=initial_density_model,
+                density_model=(best_density_model if candidate_density is None else candidate_density),
                 boundary_condition=self.boundary_condition,
                 boundary_impedance=self.boundary_impedance,
                 source_injection=self.source_injection,
             )
             return _scaled_candidate_objective(simulated_waveform)
 
-        def _evaluate_full_candidate(velocity_model, damping_model):
+        def _evaluate_full_candidate(velocity_model, damping_model, candidate_density=None):
             wavefield = pseudospectral_1D_damped(
                 num_x=num_x,
                 delta_x=delta_x,
@@ -1536,7 +1573,7 @@ class UltrasonicModeler:
                 source_time_function=best_source_time_function,
                 velocity_model=velocity_model,
                 damping_model=damping_model,
-                density_model=initial_density_model,
+                density_model=(best_density_model if candidate_density is None else candidate_density),
                 absorbing=absorbing,
                 boundary_condition=self.boundary_condition,
                 boundary_impedance=self.boundary_impedance,
@@ -1550,7 +1587,7 @@ class UltrasonicModeler:
                 delta_x=delta_x,
                 velocity_model=velocity_model,
                 damping_model=damping_model,
-                density_model=initial_density_model,
+                density_model=(best_density_model if candidate_density is None else candidate_density),
             )
             synthetic_waveform, trace_scale, objective = (
                 _scaled_candidate_objective(simulated_waveform)
@@ -1566,6 +1603,8 @@ class UltrasonicModeler:
             getattr(self, "optimization_policy", None) if use_effective_adjoint else None,
             best_velocity_model, best_damping_model, regions_to_update, v_lower, v_upper,
             activate_velocity, activate_damping, resume=getattr(self, "optimization_resume_state", None),
+            density_model=self.velocity_model_handler.density_array,
+            density_regions=(pure_gouge_indices(idx_dict) if invert_density else None),
         )
         scientific_monitor = make_monitor(getattr(self, "scientific_stop_policy", None), best_misfit, spectral_gamma, getattr(self, "scientific_stop_resume_state", None)) if material_optimizer is None else None
         scientific_fallback_reason = "budget_exhausted"
@@ -1579,7 +1618,7 @@ class UltrasonicModeler:
             damping_available = bool(
                 activate_damping and (material_optimizer is not None or da_max >= da_threshold)
             )
-            if not velocity_available and not damping_available:
+            if not velocity_available and not damping_available and not invert_density:
                 scientific_fallback_reason = "step_limits_below_threshold"
                 print("Stopping: active step sizes below thresholds.")
                 break
@@ -1628,19 +1667,25 @@ class UltrasonicModeler:
                         quantity=self.receiver_quantity,
                         delta_t=delta_t,
                     )
-                    gradient_vel, gradient_damp, adjoint_wavefield = (
+                    material_gradient_result = (
                         discrete_model_gradient_1d_kelvin_voigt(
                             wavefield=best_wavefield_forward,
                             wavefield_gradient=dJdu,
                             velocity_model=best_velocity_model,
                             damping_model=best_damping_model,
-                            density_model=initial_density_model,
+                            density_model=best_density_model,
                             delta_x=delta_x,
                             delta_t=delta_t,
                             boundary_condition=self.boundary_condition,
                             consume_wavefield_gradient=True,
+                            return_density_gradient=invert_density,
                         )
                     )
+                    if invert_density:
+                        gradient_vel, gradient_damp, gradient_density, adjoint_wavefield = material_gradient_result
+                    else:
+                        gradient_vel, gradient_damp, adjoint_wavefield = material_gradient_result
+                    del material_gradient_result
                 else:
                     residual_sim = residual_to_simulation_time(
                         observed_time=observed_time,
@@ -1682,6 +1727,8 @@ class UltrasonicModeler:
             # FORM THE TWO PARAMETER-BLOCK PROPOSALS INDEPENDENTLY
             # ------------------------------------------------------------------
             if material_optimizer is not None:
+                if invert_density:
+                    material_optimizer.set_density_gradient(best_density_model, gradient_density)
                 searched = material_optimizer.search(
                     best_velocity_model, best_damping_model, gradient_vel, gradient_damp,
                     best_misfit, _evaluate_receiver_only_candidate,
@@ -1689,6 +1736,7 @@ class UltrasonicModeler:
                 selected_candidate = searched["selected"]
                 updated_velocity_model = searched["velocity"]
                 updated_damping_model = searched["damping"]
+                updated_density_model = searched.get("density", best_density_model)
                 updated_misfit = searched["misfit"]
                 velocity_only_misfit = damping_only_misfit = cross_talk_interaction = None
                 joint_misfit = updated_misfit
@@ -1696,7 +1744,7 @@ class UltrasonicModeler:
                 if selected_candidate != "current":
                     (wavefield_forward_updated, updated_synthetic_waveform,
                      updated_trace_scale, updated_objective) = _evaluate_full_candidate(
-                        updated_velocity_model, updated_damping_model)
+                        updated_velocity_model, updated_damping_model, updated_density_model)
                     full_misfit = float(updated_objective["total"])
                     if not np.isclose(full_misfit, updated_misfit, rtol=1e-9, atol=1e-12):
                         raise RuntimeError("Searched receiver-only and full-field objectives disagree.")
@@ -1889,6 +1937,8 @@ class UltrasonicModeler:
 
                 best_velocity_model = updated_velocity_model
                 best_damping_model = updated_damping_model
+                if invert_density:
+                    best_density_model = updated_density_model
                 best_wavefield_forward = wavefield_forward_updated
                 best_synthetic_waveform = updated_synthetic_waveform
                 best_trace_scale = updated_trace_scale
@@ -1978,6 +2028,8 @@ class UltrasonicModeler:
             self.local_stop_diagnostics = None if scientific_monitor is None else scientific_monitor.finish(scientific_fallback_reason, dc_max, da_max, dc_threshold, da_threshold)
         if self.local_stop_diagnostics is not None:
             print("    Local stop:", self.local_stop_diagnostics["reason"])
+        if invert_density:
+            self.velocity_model_handler.density_array = best_density_model.copy()
         self.synthetic_waveform = best_synthetic_waveform
         self.trace_scale = float(best_trace_scale)
         if amplitude_scale_mode == "fixed":
@@ -2017,7 +2069,7 @@ class UltrasonicModeler:
                 best_wavefield_forward, best_receiver_spatial_function,
                 quantity=self.receiver_quantity, delta_t=delta_t, delta_x=delta_x,
                 velocity_model=best_velocity_model, damping_model=best_damping_model,
-                density_model=initial_density_model,
+                density_model=best_density_model,
             )
             update_model_kinematics(self, native_trace=native_best_trace)
             velocity_label = filename_label(self)
@@ -2072,6 +2124,8 @@ class UltrasonicModeler:
                 spectral_gamma=self.spectral_gamma,
             )
 
+            if invert_density:
+                density_plot(self, record_output_directory / f"{waveform_output_path.name}_density_model.png")
             plt.close('all')
 
         if not retain_wavefield:

@@ -212,6 +212,12 @@ def make_optimizer(policy,*args,resume=None,**kwargs):
 
 def reuse_material_model(sim,*,scale,gamma,taper,strategy,dc,da,objective):
     """One receiver-only evaluation, no optimization and no stored wavefield."""
+
+    # STEEL_REFERENCE_AMPLITUDE_V1
+    from lab_uw.source_amplitude import require_unit_scale
+    require_unit_scale(sim, scale)
+    require_unit_scale(sim, getattr(sim, 'reference_trace_scale', None))
+
     from .fd1d import finite_difference_1d_receiver_trace
     from .kinematic_velocity import update_model_kinematics
     if scale is None:scale=getattr(sim,'reference_trace_scale',getattr(sim,'trace_scale',None))
@@ -236,3 +242,52 @@ def reuse_material_model(sim,*,scale,gamma,taper,strategy,dc,da,objective):
     sim.average_gouge_velocity=float(np.mean(m.velocity_array[gouge]));sim.average_gouge_damping=float(np.mean(m.damping_array[gouge]))
     update_model_kinematics(sim,native_trace=raw)
     print('Model reused: receiver-only evaluation, zero gradient updates.',flush=True)
+
+
+# LOCAL_MATERIAL_COORDINATES_V1
+# The original search implementation above remains the velocity-coordinate
+# oracle. The adapter owns constitutive coordinates and checkpoint provenance.
+DEFAULTS['parameterization'] = 'velocity_damping'
+_material_settings_without_coordinates = settings
+
+def settings(params):
+    from .material_parameters import parameterization
+    result = _material_settings_without_coordinates(params)
+    parameterization(result)
+    return result
+
+def policy_digest(policy):
+    from .material_parameters import canonical_policy
+    return hashlib.sha256(json.dumps(canonical_policy(policy), sort_keys=True).encode()).hexdigest()
+
+def policy_changes(previous, current):
+    from .material_parameters import policy_changes as coordinate_policy_changes
+    return coordinate_policy_changes(previous, current, DEFAULTS)
+
+def make_optimizer(policy, *args, resume=None, density_model=None, **kwargs):
+    if not policy or not policy.get('enabled'):
+        return None
+    from .material_parameters import make_parameterized_optimizer
+    return make_parameterized_optimizer(MaterialOptimizer, policy, *args,
+        resume=resume, density_model=density_model, **kwargs)
+
+
+# LOCAL_DENSITY_INVERSION_V1
+from .density_inversion import DENSITY_DEFAULTS as _DENSITY_DEFAULTS
+DEFAULTS.update(_DENSITY_DEFAULTS)
+_settings_fixed_density = settings
+_make_optimizer_fixed_density = make_optimizer
+
+def settings(params):
+    from .density_inversion import configure_policy
+    return configure_policy(_settings_fixed_density(params), params)
+
+def make_optimizer(policy, *args, resume=None, density_model=None, density_regions=None, **kwargs):
+    if policy and policy.get('invert_density', False):
+        from .density_inversion import make_density_optimizer
+        return make_density_optimizer(MaterialOptimizer, policy, *args, resume=resume,
+            density_model=density_model, density_regions=density_regions, **kwargs)
+    if resume and resume.get('optimizer_revision') == 5:
+        raise ValueError('Cannot resume a density optimizer with invert_density=False; use a new output folder.')
+    return _make_optimizer_fixed_density(policy, *args, resume=resume,
+        density_model=density_model, **kwargs)

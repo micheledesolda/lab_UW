@@ -63,7 +63,7 @@ def _adopt_optimizer_policy(state,params):
         continuation=stopping.get('continuation') or {}
         old=continuation.get('policy')
         if (state.get('pending_position') is None or stopping.get('converged',False)
-                or continuation.get('optimizer_revision')!=3 or old is None):
+                or continuation.get('optimizer_revision') not in (3, 4, 5) or old is None):
             raise ValueError('Material optimizer policy changed after a completed reference. '
                              'Use a separate result sequence to verify that reference with new settings.')
         if optimizer_policy_digest(old)!=previous:
@@ -161,6 +161,10 @@ def _digest(functions,paired_rows,waveform_metadata,stf,params,observed_waveform
     else:
         for key in EXTRA_KEYS:science.pop(key,None)
     value={'adaptive':science,'numeric':{k:params.get(k) for k in keys}}
+    # STEEL_REFERENCE_AMPLITUDE_V1
+    from lab_uw.source_amplitude import validate_handler
+    calibration=validate_handler(stf)
+    if calibration is not None:value['source_calibration_id']=calibration['id']
     h=hashlib.sha256(json.dumps(value,sort_keys=True,default=encode).encode())
     table=np.array([[int(r.uw_idx),float(r.uw_time_s),float(r.time_s)] for r in paired_rows],dtype='<f8')
     # Mechanical observations also control the evolving geometry and stored
@@ -207,7 +211,18 @@ def configure_local_stopping(simulation,params):
     simulation.scientific_stop_resume_state=None
     simulation.optimization_policy=None
     simulation.optimization_resume_state=None
-    if not enabled(params):return
+    # LOCAL_MATERIAL_COORDINATES_V1
+    from .material_parameters import parameterization
+    coordinate_policy = optimizer_settings(params)
+    simulation.local_material_parameterization = parameterization(coordinate_policy)
+    # LOCAL_DENSITY_INVERSION_V1
+    from .density_inversion import prepare
+    prepare(simulation, coordinate_policy)
+    if not enabled(params):
+        if simulation.local_material_parameterization == "modulus_viscosity" or coordinate_policy.get("invert_density", False):
+            simulation.optimization_policy = coordinate_policy
+            simulation.optimization_resume_state = deepcopy(params.get("_adaptive_resume_monitor"))
+        return
     s=settings(params)
     if hasattr(simulation,'adaptive_signal_mask'):
         simulation.misfit_interval=simulation.adaptive_signal_mask.copy()
@@ -420,7 +435,9 @@ def run_sequence(functions,*,paired_rows,start_position,observed_waveform_data,w
                   f'J_noise={decision["noise_pair_misfit"]:.6g}, threshold={decision["effective_threshold"]:.6g}, '
                   f'{decision.get("gate_status","pending")}',flush=True)
         local_params=dict(params)
+        # ADAPTIVE_REUSE_WITHOUT_FORWARD_V1
         local_params['_adaptive_reuse']=reuse
+        if reuse:local_params['_adaptive_model_origin_rec_n']=int(state['reference_rec_n'])
         local_params['_adaptive_first_reference']=first
         if not first and not reuse and not continuing and s['reuse_last_step_limits']:
             learned=reusable_step_limits(state.get('last_step_limits'),params['reduce_factor'])
@@ -478,7 +495,7 @@ def run_sequence(functions,*,paired_rows,start_position,observed_waveform_data,w
         reason=('waiting for a second moderate change' if decision.get('gate_status')=='awaiting_confirmation'
                 else 'noise-compatible model reuse') if reuse else (simulation.local_stop_diagnostics or {}).get('reason','budget_exhausted')
         print(f'Adaptive {position+1}/{len(paired_rows)}: rec_n={assembly["rec_n"]}, reference={state["reference_rec_n"]}, '
-              f'J={simulation.misfit:.6g}, {reason}',flush=True)
+              f'J_model={"not_evaluated, forward=skipped" if reuse else format(simulation.misfit, ".6g")}, {reason}',flush=True)
     print(f'Adaptive completed: {optimized} optimized records, {reused} reused records in this pass.',flush=True)
 
 

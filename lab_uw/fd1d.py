@@ -643,12 +643,14 @@ def discrete_model_gradient_1d_kelvin_voigt(
     delta_t: float,
     boundary_condition: BoundaryCondition,
     consume_wavefield_gradient: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return_density_gradient: bool = False,
+) -> tuple[np.ndarray, ...]:
     """Reverse-mode derivative of the implemented leapfrog recurrence.
 
     Returns gradients with respect to nodal velocity and Kelvin--Voigt
     damping, plus the accumulated adjoint wavefield, while density is held
-    fixed.  The differentiated constitutive coefficients are
+    fixed by default. With return_density_gradient=True, return (g_c, g_nu, g_rho, adjoint).
+    The differentiated constitutive coefficients are
     ``M=rho*c**2`` and ``eta=rho*nu`` and the nodal acceleration contains the
     same ``1/rho`` factor as the forward recurrence. ``wavefield_gradient``
     must be the derivative of the scalar objective with respect to the stored
@@ -698,6 +700,8 @@ def discrete_model_gradient_1d_kelvin_voigt(
     grad_modulus_half = np.zeros_like(modulus_half)
     grad_viscosity_half = np.zeros_like(viscosity_half)
     zero = np.zeros(velocity.size, dtype=float)
+    # LOCAL_DENSITY_INVERSION_V1
+    grad_density_inertia = np.zeros_like(density) if return_density_gradient else None
 
     for k in range(u.shape[0] - 1, -1, -1):
         # The stored row k is u_next for recurrence k.  Fixed boundaries are
@@ -714,6 +718,17 @@ def discrete_model_gradient_1d_kelvin_voigt(
             (u_curr[1:] - u_curr[:-1])
             - (u_prev[1:] - u_prev[:-1])
         ) / dx
+
+        if return_density_gradient:
+            # Differentiate the nodal inverse mass at fixed M and eta.
+            # The existing source is acceleration f*s, independent of rho.
+            traction = modulus_half * grad_curr + viscosity_half * grad_delta / dt
+            divergence = np.empty_like(density)
+            factor = 2.0 if boundary_condition == "free" else 1.0
+            divergence[0] = factor * traction[0] / dx
+            divergence[1:-1] = (traction[1:] - traction[:-1]) / dx
+            divergence[-1] = -factor * traction[-1] / dx
+            grad_density_inertia -= dt*dt * bar_next * divergence / (density*density)
 
         # u_next contains dt**2 * D(q) / rho.  Density is fixed, so its
         # reciprocal weights the recurrence adjoint before D.T is applied.
@@ -742,4 +757,8 @@ def discrete_model_gradient_1d_kelvin_voigt(
     # M=rho*c**2 and eta=rho*nu, with rho fixed.
     grad_velocity = 2.0 * density * velocity * grad_modulus
     grad_damping = density * grad_viscosity
+    if return_density_gradient:
+        # Chain rule back to (c, nu, rho) at fixed c and nu.
+        grad_density = grad_density_inertia + velocity**2*grad_modulus + damping*grad_viscosity
+        return grad_velocity, grad_damping, grad_density, bar_u
     return grad_velocity, grad_damping, bar_u

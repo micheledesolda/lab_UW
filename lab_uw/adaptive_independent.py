@@ -304,7 +304,8 @@ def _reuse_row(functions,context,manifest,position,reference):
     simulation.adaptive_signal_mask=manifest['signal_mask'].copy();simulation.adaptive_noise_mask=manifest['noise_mask'].copy()
     simulation.independent_velocity_lower_bound_cm_us=manifest['velocity_lower_bound_cm_us']
     p={k:v for k,v in context['params'].items() if k!='_adaptive_independent_context'}
-    p.update(_adaptive_reuse=True,n_iterations=0)
+    p.update(_adaptive_reuse=True,n_iterations=0,
+             _adaptive_model_origin_rec_n=reference["adaptive_inversion"]["model_origin_rec_n"])
     p.pop('_adaptive_resume_monitor',None);p.pop('_adaptive_resume_limits',None)
     if not sequence.settings(p)['plot_reused_records']:
         p['plot_save_interval']=10**15;p['local_spectral_diagnostics_enabled']=False
@@ -332,8 +333,11 @@ def _reuse_row(functions,context,manifest,position,reference):
 
 
 def _misfit_progress(row):
-    # DISTINCT_MODEL_AND_DATA_MISFIT_LOG_V1
-    text=f'J_model={row["misfit"]:.6g}'
+    # ADAPTIVE_REUSE_WITHOUT_FORWARD_V1
+    if row.get('model_misfit_evaluated', True):
+        text=f'J_model={row["misfit"]:.6g}'
+    else:
+        text='J_model=not_evaluated, forward=skipped'
     decision=(row.get('adaptive_inversion') or {}).get('decision') or {}
     if decision:
         text+=(f', J_data={decision["data_reference_misfit"]:.6g}'
@@ -368,7 +372,8 @@ def _commit(functions,context,manifest,stream,next_position,last):
 
 def _adopt_optimizer(manifest,params,directory,completed_count):
     new=optimizer_settings(params);old=manifest['optimizer_policy']
-    if old==new:return
+    # LOCAL_MATERIAL_COORDINATES_V1
+    if policy_digest(old)==policy_digest(new):return
     changes=policy_changes(old,new)
     complete=bool(completed_count)
     if not complete:

@@ -2,6 +2,8 @@
 
 This diagnostic never changes FWI parameters, gradients or step limits.
 The fixed positive lobe is a timing indicator, not a first-break estimator.
+The homogeneous arrival family always retains the global reference density
+and damping. The current profile is propagated with its actual coefficients.
 """
 from __future__ import annotations
 from copy import deepcopy
@@ -16,6 +18,7 @@ GROOVES = {'groove_sb1': 'side_block_1', 'groove_cb1': 'central_block',
 VARIABLE = ('gouge_1', 'gouge_2')
 SPEED_ROOT_TOLERANCE_M_S = 1e-5
 BOUNDARY_AWARE_KINEMATICS_V2 = True
+FIXED_REFERENCE_DENSITY_KINEMATICS_V3 = True
 
 _STATE_FIELDS=(('v','velocity_array'),('nu','damping_array'),('rho','density_array'),
                ('source','source_spatial_function'),('receiver','receiver_spatial_function'))
@@ -68,7 +71,7 @@ def _hash(*values):
     return h.hexdigest()
 
 def reference_from_state(state):
-    """Capture the GLOBAL homogeneous reference, including fixed damping."""
+    """Capture the GLOBAL homogeneous reference, including density and damping."""
     idx=state['idx_dict'];v=np.asarray(state['velocity_array']);a=np.asarray(state['damping_array'])
     _,missing=_region_coverage(idx,len(v))
     ii=np.concatenate([idx[k] for k in VARIABLE]);v0=float(np.mean(v[ii])) if len(ii) else np.nan
@@ -155,18 +158,28 @@ class ArrivalFamily:
         if _hash(np.asarray(sim.source_handler.time_function))!=self.ref['source_time_hash']:
             raise ValueError('Temporal source changed from the homogeneous reference.')
         self.v=np.empty_like(m.velocity_array);self.nu=np.empty_like(m.damping_array)
+        self.rho=np.empty_like(m.density_array)
+        current_rho=np.asarray(m.density_array)
+        if current_rho.shape!=self.v.shape or not np.all(np.isfinite(current_rho)) or np.any(current_rho<=0):
+            raise ValueError('Current profile density must be finite, positive and defined on the current grid.')
         covered,missing=_region_coverage(m.idx_dict,len(self.v))
         assigned=np.zeros(len(self.v),dtype=bool)
         for name,ii in m.idx_dict.items():
             ii=np.asarray(ii,dtype=int);r=self.ref['regions'].get(name)
             if r is None:raise ValueError(f'Unknown material region {name}.')
             vv=_remap(r['v'],len(ii),name);aa=_remap(r['nu'],len(ii),name)
+            rr=_remap(r['rho'],len(ii),name)
             common=assigned[ii]
             if (not np.allclose(self.v[ii[common]],vv[common],rtol=1e-10,atol=1e-12)
-                    or not np.allclose(self.nu[ii[common]],aa[common],rtol=1e-10,atol=1e-12)):
+                    or not np.allclose(self.nu[ii[common]],aa[common],rtol=1e-10,atol=1e-12)
+                    or not np.allclose(self.rho[ii[common]],rr[common],rtol=1e-10,atol=1e-12)):
                 raise ValueError(f'Reference coefficients disagree at a shared interface of {name}.')
-            self.v[ii]=vv;self.nu[ii]=aa;assigned[ii]=True
-            for key,current in [('rho',m.density_array),('source',sim.source_handler.spatial_function),
+            self.v[ii]=vv;self.nu[ii]=aa;self.rho[ii]=rr;assigned[ii]=True
+            # Density is free only in pure gouge. Fixed metal, mixed regions
+            # and any shared interface nodes retain their consistency guards.
+            if name not in VARIABLE and not np.allclose(rr,current_rho[ii],rtol=1e-10,atol=1e-12):
+                raise ValueError(f'rho changed in fixed region {name}; fixed reference is no longer valid.')
+            for key,current in [('source',sim.source_handler.spatial_function),
                                 ('receiver',sim.receiver_handler.spatial_function)]:
                 expected=_remap(r[key],len(ii),name)
                 if not np.allclose(expected,np.asarray(current)[ii],rtol=1e-10,atol=1e-12):
@@ -185,15 +198,18 @@ class ArrivalFamily:
                 for key,field in _STATE_FIELDS:
                     if not np.isclose(values[key],np.asarray(current[field])[i],rtol=1e-10,atol=1e-12):
                         raise ValueError(f'{key} changed at the fixed {side} solver boundary.')
-                self.v[i]=values['v'];self.nu[i]=values['nu']
+                self.v[i]=values['v'];self.nu[i]=values['nu'];self.rho[i]=values['rho']
+        if not np.all(np.isfinite(self.rho)) or np.any(self.rho<=0):
+            raise ValueError('Reference density must be finite and positive.')
+        self.profile_density_changed=not np.allclose(self.rho,current_rho,rtol=1e-10,atol=1e-12)
         self.coverage_report={'shared_interface_nodes':np.flatnonzero(covered>1).tolist(),
                               'fixed_unassigned_outer_nodes':missing.tolist()}
         self.idx=m.idx_dict
         if not np.allclose(self.profile(self.ref['v0_m_s']),self.v,rtol=1e-10,atol=1e-12):
             raise ValueError('Homogeneous family does not reproduce its reference coefficients.')
-        self.key=_hash('boundary-aware-v2',self.ref['reference_hash'],self.v,self.nu,
+        self.key=_hash('fixed-reference-density-v3',self.ref['reference_hash'],self.v,self.nu,
                        sim.grid_handler.spatial_axis,float(sim.grid_handler.dx),
-                       self.time,m.density_array,sim.source_handler.spatial_function,
+                       self.time,self.rho,sim.source_handler.spatial_function,
                        sim.receiver_handler.spatial_function,sim.source_handler.time_function,
                        [sim.receiver_quantity,sim.boundary_condition,sim.boundary_impedance,sim.source_injection],
                        {k:np.asarray(v).tolist() for k,v in self.idx.items()})
@@ -203,6 +219,7 @@ class ArrivalFamily:
             allcache[self.key]={'times':{},'window_us':None}
         self.entry=allcache[self.key];self.cache=self.entry['times']
         sim._kinematic_cache=allcache;self.forward_calls=0
+        self.calibration_forward_calls=0;self.profile_forward_calls=0
 
     def profile(self,speed):
         v=self.v.copy();c=float(speed)/1e4
@@ -212,13 +229,21 @@ class ArrivalFamily:
             v[self.idx[groove]]=np.sqrt((1-f)*cb**2+f*c**2)
         return v
 
-    def trace(self,v,nu):
+    def trace(self,v,nu,density_model=None):
+        """Replay the reference family, or an explicit physical profile.
+
+        Omitting density selects the frozen reference, never the current
+        inverted density. A profile replay must supply its actual density.
+        """
         s=self.sim;clock=s.sim_time_handler;self.forward_calls+=1
+        if density_model is None:
+            density_model=self.rho;self.calibration_forward_calls+=1
+        else:self.profile_forward_calls+=1
         return finite_difference_1d_receiver_trace(num_x=len(v),delta_x=s.grid_handler.dx,
             num_t=clock.num_t,delta_t=clock.dt,source_spatial_function=s.source_handler.spatial_function,
             source_time_function=s.source_handler.time_function,receiver_spatial_function=s.receiver_handler.spatial_function,
             receiver_quantity=s.receiver_quantity,velocity_model=v,damping_model=nu,
-            density_model=s.velocity_model_handler.density_array,boundary_condition=s.boundary_condition,
+            density_model=density_model,boundary_condition=s.boundary_condition,
             boundary_impedance=s.boundary_impedance,source_injection=s.source_injection)
 
     def evaluate(self,speed):
@@ -260,15 +285,20 @@ def update_model_kinematics(sim,native_trace=None):
         if 'unavailable_reason' in ref:raise ValueError(ref['unavailable_reason'])
         family=ArrivalFamily(sim);t0=family.evaluate(ref['v0_m_s'])
         if native_trace is None:
-            m=sim.velocity_model_handler;native_trace=family.trace(m.velocity_array,m.damping_array)
+            m=sim.velocity_model_handler
+            native_trace=family.trace(m.velocity_array,m.damping_array,density_model=m.density_array)
         tp=arrival_time(family.time,native_trace,family.entry['window_us']);speed=family.invert(tp)
         result={'schema':1,'status':'ok','definition':'v_kin = inverse(T_hom)(T_profile)',
+                'calibration_revision':3,'calibration_policy':'fixed_global_density_and_damping',
+                'profile_density_changed':family.profile_density_changed,
+                'reference_density_hash':_hash(family.rho),
                 'feature':'fixed_positive_lobe_quadratic_interpolation','time_grid':'native_solver',
                 'reference_velocity_m_s':ref['v0_m_s'],'reference_arrival_us':t0,
                 'arrival_us':tp,'arrival_change_ns':1000*(tp-t0),'velocity_m_s':speed,
                 'arrival_window_us':tuple(family.entry['window_us']),'geometry_key':family.key,
                 'homogeneous_replay_residual_ns':1000*(family.evaluate(speed)-tp),
-                'calibration_forward_calls':family.forward_calls,
+                'calibration_forward_calls':family.calibration_forward_calls,
+                'profile_forward_calls':family.profile_forward_calls,
                 'region_coverage':family.coverage_report,
                 'arithmetic_gouge_velocity_m_s':float(np.mean(sim.velocity_model_handler.velocity_array[
                     np.concatenate([sim.velocity_model_handler.idx_dict[k] for k in VARIABLE])])*1e4)}

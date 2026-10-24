@@ -1,0 +1,10 @@
+{
+  "unit_tests": 9,
+  "unit_tests_passed": true,
+  "original_main_AST_compile": true,
+  "experimental_map_created": false,
+  "reason": "Il file analysis non contiene le tracce simulate; eseguire sul pickle originale completo.",
+  "forwards_run": 0,
+  "inversions_run": 0,
+  "visual_QA": "Layout verificato su fixture sintetica; figure della fixture escluse dalla consegna."
+}
