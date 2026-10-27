@@ -144,6 +144,9 @@ def _repair_tail(path,truncate_to):
     print(f'Independent resume: incomplete tail retained at {backup}.',flush=True)
 
 def _plan(functions,manifest,paired_rows,data,params):
+    if params.get('_adaptive_preselection') is not None:
+        from .adaptive_preselection import frozen_plan
+        return frozen_plan(functions,manifest,paired_rows,params)
     s=sequence.settings(params);signal=manifest['signal_mask'];noise=manifest['noise_mask']
     taper=float(params.get('local_objective_taper_fraction',0.));anchor=manifest['anchor']
     ref_position=anchor;ref=np.asarray(data[int(paired_rows[anchor].uw_idx)])

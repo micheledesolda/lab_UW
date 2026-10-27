@@ -118,7 +118,6 @@ def _waveform_interval_indices(interval, size: int) -> np.ndarray:
         raise IndexError("waveform interval contains out-of-range indices")
     return indices
 
-
 def relative_waveform_objective(
     observed_waveform: np.ndarray,
     predicted_waveform: np.ndarray,
@@ -129,52 +128,57 @@ def relative_waveform_objective(
     return_gradient: bool = False,
     eps: float = 1.0e-15,
 ) -> Dict[str, Any]:
-    r"""Dimensionless amplitude--spectrum--phase waveform objective.
+    r"""Relative squared-L2 misfit plus independent spectral-shape penalty.
 
-    For the windowed observed and predicted traces ``d`` and ``p`` this
-    evaluates
+    For the windowed and optionally tapered signals ``d`` and ``p``:
 
     .. math::
 
         J_\gamma = \frac{\|d-p\|_2^2}{\|d\|_2^2}
-        + 2 r (\gamma-1)D_f^2,
+        + \gamma D_f^2,
 
-    where ``r=||p||/||d||`` and ``D_f^2`` is the squared Hellinger distance
-    between their normalised spectral-energy distributions.  Equivalently,
+    where ``D_f^2 = 1 - sum(|FFT(d)| |FFT(p)|) / (||d|| ||p||)``
+    is the squared Hellinger distance between normalised spectral energies.
 
-    .. math::
+    gamma=0: relative squared L2 objective.
+    gamma=1: relative squared L2 plus spectral-shape distance.
 
-        J_\gamma=(1-r)^2+2r(\gamma D_f^2+J_\phi).
-
-    Thus ``gamma=1`` is exactly the ordinary relative L2 objective.  The
-    returned gradient is that of ``0.5 * J_gamma`` with respect to the full
-    predicted trace; this convention matches the adjoint residual used by the
-    inversion.
+    The returned gradient is that of 0.5 * J_gamma with respect to
+    the full predicted trace, as required by the adjoint inversion.
     """
 
     observed = np.asarray(observed_waveform, dtype=float).reshape(-1)
     predicted = np.asarray(predicted_waveform, dtype=float).reshape(-1)
+
     if observed.size != predicted.size:
         raise ValueError("observed and predicted waveforms must have equal size")
+
     gamma = float(spectral_gamma)
     taper = float(taper_fraction)
+
     if not np.isfinite(gamma) or gamma < 0.0:
         raise ValueError("spectral_gamma must be finite and non-negative")
+
     if not np.isfinite(taper) or not 0.0 <= taper <= 1.0:
         raise ValueError("taper_fraction must lie in [0, 1]")
 
     indices = _waveform_interval_indices(interval, observed.size)
-    weights = tukey(indices.size, alpha=taper) if taper > 0.0 else np.ones(indices.size)
+
+    weights = (
+        tukey(indices.size, alpha=taper)
+        if taper > 0.0
+        else np.ones(indices.size)
+    )
+
     data = weights * observed[indices]
     prediction = weights * predicted[indices]
 
     data_norm = float(np.linalg.norm(data))
     prediction_norm = float(np.linalg.norm(prediction))
+
     if data_norm <= eps:
-        # A zero observed trace is useful in forward-only calls and unit tests,
-        # although a relative data objective is then undefined.  Fall back to
-        # absolute prediction energy rather than preventing the forward run.
         total = float(np.dot(prediction, prediction))
+
         result = {
             "total": total,
             "relative_l2": total,
@@ -185,14 +189,20 @@ def relative_waveform_objective(
             "correlation": 0.0,
             "spectral_gamma": gamma,
         }
+
         if return_gradient:
             gradient = np.zeros_like(predicted)
             gradient[indices] = weights * prediction
             result["gradient_predicted"] = gradient
+
         return result
 
     residual = prediction - data
-    relative_l2 = float(np.dot(residual, residual) / (data_norm * data_norm))
+
+    relative_l2 = float(
+        np.dot(residual, residual) / (data_norm * data_norm)
+    )
+
     amplitude_ratio = prediction_norm / data_norm
 
     if prediction_norm <= eps:
@@ -200,42 +210,62 @@ def relative_waveform_objective(
         correlation = 0.0
         phase_misfit = 0.0
         spectral_gradient_window = np.zeros_like(prediction)
+
     else:
         data_fft = np.fft.fft(data, norm="ortho")
         prediction_fft = np.fft.fft(prediction, norm="ortho")
+
         data_spectral_shape = np.abs(data_fft) / data_norm
         prediction_spectral_shape = np.abs(prediction_fft) / prediction_norm
+
         spectral_affinity = float(
             np.dot(data_spectral_shape, prediction_spectral_shape)
         )
-        spectral_affinity = float(np.clip(spectral_affinity, 0.0, 1.0))
+
+        spectral_affinity = float(
+            np.clip(spectral_affinity, 0.0, 1.0)
+        )
+
         spectral_distance_squared = 1.0 - spectral_affinity
+
         correlation = float(
             np.dot(data, prediction) / (data_norm * prediction_norm)
         )
+
         correlation = float(np.clip(correlation, -1.0, 1.0))
+
         phase_misfit = max(
             0.0,
             1.0 - correlation - spectral_distance_squared,
         )
 
-        unit_phase = np.zeros_like(prediction_fft, dtype=complex)
-        nonzero = np.abs(prediction_fft) > eps
-        unit_phase[nonzero] = (
-            prediction_fft[nonzero] / np.abs(prediction_fft[nonzero])
-        )
-        affinity_gradient = np.fft.ifft(
-            data_spectral_shape * unit_phase,
-            norm="ortho",
-        ).real
-        spectral_gradient_window = (
-            prediction / prediction_norm - affinity_gradient
-        ) / data_norm
+        if return_gradient and gamma > 0.0:
+            unit_phase = np.zeros_like(prediction_fft, dtype=complex)
+
+            nonzero = np.abs(prediction_fft) > eps
+
+            unit_phase[nonzero] = (
+                prediction_fft[nonzero]
+                / np.abs(prediction_fft[nonzero])
+            )
+
+            affinity_gradient = np.fft.ifft(
+                data_spectral_shape * unit_phase,
+                norm="ortho",
+            ).real
+
+            spectral_gradient_window = (
+                spectral_affinity * prediction / prediction_norm
+                - affinity_gradient
+            ) / prediction_norm
+
+        else:
+            spectral_gradient_window = np.zeros_like(prediction)
 
     amplitude_misfit = (1.0 - amplitude_ratio) ** 2
-    total = relative_l2 + 2.0 * amplitude_ratio * (
-        gamma - 1.0
-    ) * spectral_distance_squared
+
+    # NEW OBJECTIVE: relative L2 + independent spectral penalty
+    total = relative_l2 + gamma * spectral_distance_squared
 
     result: Dict[str, Any] = {
         "total": float(total),
@@ -247,14 +277,158 @@ def relative_waveform_objective(
         "correlation": float(correlation),
         "spectral_gamma": gamma,
     }
+
     if return_gradient:
-        # Gradient of 0.5*J_gamma with respect to the tapered prediction.
+        # Gradient of 0.5 * J_gamma
         gradient_window = residual / (data_norm * data_norm)
-        gradient_window += (gamma - 1.0) * spectral_gradient_window
+
+        gradient_window += (
+            0.5 * gamma * spectral_gradient_window
+        )
+
         gradient = np.zeros_like(predicted)
         gradient[indices] = weights * gradient_window
+
         result["gradient_predicted"] = gradient
+
     return result
+
+# def relative_waveform_objective(
+#     observed_waveform: np.ndarray,
+#     predicted_waveform: np.ndarray,
+#     interval,
+#     *,
+#     spectral_gamma: float = 1.0,
+#     taper_fraction: float = 0.0,
+#     return_gradient: bool = False,
+#     eps: float = 1.0e-15,
+# ) -> Dict[str, Any]:
+#     r"""Dimensionless amplitude--spectrum--phase waveform objective.
+
+#     For the windowed observed and predicted traces ``d`` and ``p`` this
+#     evaluates
+
+#     .. math::
+
+#         J_\gamma = \frac{\|d-p\|_2^2}{\|d\|_2^2}
+#         + 2 r (\gamma-1)D_f^2,
+
+#     where ``r=||p||/||d||`` and ``D_f^2`` is the squared Hellinger distance
+#     between their normalised spectral-energy distributions.  Equivalently,
+
+#     .. math::
+
+#         J_\gamma=(1-r)^2+2r(\gamma D_f^2+J_\phi).
+
+#     Thus ``gamma=1`` is exactly the ordinary relative L2 objective.  The
+#     returned gradient is that of ``0.5 * J_gamma`` with respect to the full
+#     predicted trace; this convention matches the adjoint residual used by the
+#     inversion.
+#     """
+
+#     observed = np.asarray(observed_waveform, dtype=float).reshape(-1)
+#     predicted = np.asarray(predicted_waveform, dtype=float).reshape(-1)
+#     if observed.size != predicted.size:
+#         raise ValueError("observed and predicted waveforms must have equal size")
+#     gamma = float(spectral_gamma)
+#     taper = float(taper_fraction)
+#     if not np.isfinite(gamma) or gamma < 0.0:
+#         raise ValueError("spectral_gamma must be finite and non-negative")
+#     if not np.isfinite(taper) or not 0.0 <= taper <= 1.0:
+#         raise ValueError("taper_fraction must lie in [0, 1]")
+
+#     indices = _waveform_interval_indices(interval, observed.size)
+#     weights = tukey(indices.size, alpha=taper) if taper > 0.0 else np.ones(indices.size)
+#     data = weights * observed[indices]
+#     prediction = weights * predicted[indices]
+
+#     data_norm = float(np.linalg.norm(data))
+#     prediction_norm = float(np.linalg.norm(prediction))
+#     if data_norm <= eps:
+#         # A zero observed trace is useful in forward-only calls and unit tests,
+#         # although a relative data objective is then undefined.  Fall back to
+#         # absolute prediction energy rather than preventing the forward run.
+#         total = float(np.dot(prediction, prediction))
+#         result = {
+#             "total": total,
+#             "relative_l2": total,
+#             "amplitude_misfit": total,
+#             "spectral_shape_misfit": 0.0 if prediction_norm <= eps else 1.0,
+#             "phase_misfit": 0.0,
+#             "amplitude_ratio": 0.0 if prediction_norm <= eps else np.inf,
+#             "correlation": 0.0,
+#             "spectral_gamma": gamma,
+#         }
+#         if return_gradient:
+#             gradient = np.zeros_like(predicted)
+#             gradient[indices] = weights * prediction
+#             result["gradient_predicted"] = gradient
+#         return result
+
+#     residual = prediction - data
+#     relative_l2 = float(np.dot(residual, residual) / (data_norm * data_norm))
+#     amplitude_ratio = prediction_norm / data_norm
+
+#     if prediction_norm <= eps:
+#         spectral_distance_squared = 1.0
+#         correlation = 0.0
+#         phase_misfit = 0.0
+#         spectral_gradient_window = np.zeros_like(prediction)
+#     else:
+#         data_fft = np.fft.fft(data, norm="ortho")
+#         prediction_fft = np.fft.fft(prediction, norm="ortho")
+#         data_spectral_shape = np.abs(data_fft) / data_norm
+#         prediction_spectral_shape = np.abs(prediction_fft) / prediction_norm
+#         spectral_affinity = float(
+#             np.dot(data_spectral_shape, prediction_spectral_shape)
+#         )
+#         spectral_affinity = float(np.clip(spectral_affinity, 0.0, 1.0))
+#         spectral_distance_squared = 1.0 - spectral_affinity
+#         correlation = float(
+#             np.dot(data, prediction) / (data_norm * prediction_norm)
+#         )
+#         correlation = float(np.clip(correlation, -1.0, 1.0))
+#         phase_misfit = max(
+#             0.0,
+#             1.0 - correlation - spectral_distance_squared,
+#         )
+
+#         unit_phase = np.zeros_like(prediction_fft, dtype=complex)
+#         nonzero = np.abs(prediction_fft) > eps
+#         unit_phase[nonzero] = (
+#             prediction_fft[nonzero] / np.abs(prediction_fft[nonzero])
+#         )
+#         affinity_gradient = np.fft.ifft(
+#             data_spectral_shape * unit_phase,
+#             norm="ortho",
+#         ).real
+#         spectral_gradient_window = (
+#             prediction / prediction_norm - affinity_gradient
+#         ) / data_norm
+
+#     amplitude_misfit = (1.0 - amplitude_ratio) ** 2
+#     total = relative_l2 + 2.0 * amplitude_ratio * (
+#         gamma - 1.0
+#     ) * spectral_distance_squared
+
+#     result: Dict[str, Any] = {
+#         "total": float(total),
+#         "relative_l2": relative_l2,
+#         "amplitude_misfit": float(amplitude_misfit),
+#         "spectral_shape_misfit": float(spectral_distance_squared),
+#         "phase_misfit": float(phase_misfit),
+#         "amplitude_ratio": float(amplitude_ratio),
+#         "correlation": float(correlation),
+#         "spectral_gamma": gamma,
+#     }
+#     if return_gradient:
+#         # Gradient of 0.5*J_gamma with respect to the tapered prediction.
+#         gradient_window = residual / (data_norm * data_norm)
+#         gradient_window += (gamma - 1.0) * spectral_gradient_window
+#         gradient = np.zeros_like(predicted)
+#         gradient[indices] = weights * gradient_window
+#         result["gradient_predicted"] = gradient
+#     return result
 
 
 def select_cross_talk_candidate(
@@ -1309,11 +1483,11 @@ class UltrasonicModeler:
             raise ValueError(
                 "amplitude_scale_mode must be 'profiled', 'fixed', or 'none'"
             )
-        if amplitude_scale_mode == "profiled" and float(spectral_gamma) != 1.0:
-            raise ValueError(
-                "profiled amplitude is compatible only with spectral_gamma=1; "
-                "use a fixed experiment-wide trace scale for spectral reweighting"
-            )
+        # if amplitude_scale_mode == "profiled" and float(spectral_gamma) != 1.0:
+        #     raise ValueError(
+        #         "profiled amplitude is compatible only with spectral_gamma=1; "
+        #         "use a fixed experiment-wide trace scale for spectral reweighting"
+        #     )
         update_strategy = str(update_strategy).strip().lower()
         if update_strategy not in {"joint", "alternating", "cross_talk"}:
             raise ValueError(

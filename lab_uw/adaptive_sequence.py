@@ -116,8 +116,8 @@ def validate(params):
     if bound is not None and (not np.isfinite(bound) or bound<=0):raise ValueError('velocity_lower_bound_m_s must be positive and finite or None.')
     if not params.get('run_local_inversion',True):
         raise ValueError('Adaptive inversion requires run_local_inversion=True.')
-    if float(params.get('local_spectral_gamma',1.))!=1.:
-        raise ValueError('Adaptive noise criteria require local_spectral_gamma=1. Disable adaptive_inversion for gamma!=1.')
+    # if float(params.get('local_spectral_gamma',1.))!=1.:
+    #     raise ValueError('Adaptive noise criteria require local_spectral_gamma=1. Disable adaptive_inversion for gamma!=1.')
     if params.get('teeth_bank_enabled',False) or params.get('teeth_continuous_enabled',False):
         raise ValueError('Adaptive inversion is implemented for the original FD/Kelvin-Voigt forward.')
     for key in ('first_max_iterations','update_max_iterations','gate_calibration_records','block_accepted_updates','patience_blocks','update_block_accepted_updates','update_patience_blocks','gate_confirm_records'):
@@ -161,6 +161,8 @@ def _digest(functions,paired_rows,waveform_metadata,stf,params,observed_waveform
     else:
         for key in EXTRA_KEYS:science.pop(key,None)
     value={'adaptive':science,'numeric':{k:params.get(k) for k in keys}}
+    if params.get('_adaptive_preselection') is not None:
+        value['adaptive_preselection_fingerprint']=params['_adaptive_preselection']['fingerprint']
     # STEEL_REFERENCE_AMPLITUDE_V1
     from lab_uw.source_amplitude import validate_handler
     calibration=validate_handler(stf)
@@ -224,11 +226,10 @@ def configure_local_stopping(simulation,params):
             simulation.optimization_resume_state = deepcopy(params.get("_adaptive_resume_monitor"))
         return
     s=settings(params)
-    if hasattr(simulation,'adaptive_signal_mask'):
-        simulation.misfit_interval=simulation.adaptive_signal_mask.copy()
-        noise=simulation.adaptive_noise_mask
+    if hasattr(simulation, 'adaptive_signal_mask'):
+        noise = simulation.adaptive_noise_mask
     else:
-        mask,noise=_masks(simulation,s);simulation.misfit_interval=mask
+        _, noise = _masks(simulation, s)
     if params.get('_adaptive_reuse',False):return
     taper=float(params.get('local_objective_taper_fraction',0.))
     ed,en,factor=_levels(simulation.observed_waveform,simulation.misfit_interval,noise,taper)
