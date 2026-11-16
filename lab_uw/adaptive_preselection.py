@@ -40,8 +40,8 @@ def select_and_export(functions, *, paired, observed_waveform_data, waveform_met
     if not sequence.enabled(params):
         raise ValueError('Adaptive preselection requires adaptive_inversion.enabled=True.')
     s=sequence.settings(params)
-    if float(params.get('local_spectral_gamma',1.))!=1.:
-        raise ValueError('Adaptive preselection requires local_spectral_gamma=1.')
+    # if float(params.get('local_spectral_gamma',1.))!=1.:
+    #     raise ValueError('Adaptive preselection requires local_spectral_gamma=1.')
     for key in ('gate_calibration_records','gate_confirm_records'):
         if isinstance(s[key],bool) or int(s[key])!=s[key] or s[key]<1:
             raise ValueError(f'{key} must be a positive integer.')

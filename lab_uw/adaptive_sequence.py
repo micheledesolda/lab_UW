@@ -14,31 +14,32 @@ from scipy.signal.windows import tukey
 
 from .wave_difference_preinversion import _noise_window
 from .orchestration_restart import enrich_local_checkpoint, _restore_runtime, merge_iteration_history
-from .adaptive_diagnostics import record_gate, confirm_gate, reusable_step_limits
+from .adaptive_diagnostics import record_gate, confirm_gate
 from .kinematic_velocity import ensure_reference, reference_from_state, result_fields
 from .material_optimizer import (settings as optimizer_settings, policy_digest as optimizer_policy_digest,
                                  policy_changes as optimizer_policy_changes)
 
 
-DEFAULTS={
-    'mode':'sequential','initial_model':'local','velocity_lower_bound_m_s':None,'gate_enabled':True,
-    'enabled':True,'first_max_iterations':500,'update_max_iterations':100,
-    'output_subdirectory':'adaptive_noise',
-    'signal_window_us':None,'noise_window_us':None,'noise_end_us':10.,
-    'gate_noise_quantile':.99,'gate_noise_factor':1.25,'gate_calibration_records':200,
-    'noise_stop_factor':1.5,'plateau_noise_fraction':.1,
-    'block_accepted_updates':20,'patience_blocks':3,'probe_factors':[2.,.5],
-    'plot_reused_records':False,
-    'require_verified_reference':True,
-    # New-wave policy; first calibration and pending continuations retain their policy.
-    'update_block_accepted_updates':10,'update_patience_blocks':1,'update_plateau_noise_fraction':1.,
-    'gate_confirm_records':2,'gate_strong_factor':2.,'reuse_last_step_limits':True,
-    'plot_gate_updates':True,'plot_gate_reused_records':False,
-}
+# Scientific configuration SCHEMA ONLY. No numerical defaults.
+REQUIRED_KEYS = (
+    'enabled','mode','initial_model','velocity_lower_bound_m_s',
+    'independent_lower_bound_fraction','gate_enabled','gate_metric',
+    'signal_window_source','signal_window_us','minimum_signal_samples',
+    'minimum_signal_energy','noise_window_us','noise_end_us',
+    'gate_noise_quantile','gate_noise_factor','gate_calibration_records',
+    'gate_fallback_noise_multiplier',
+    'gate_confirm_records','gate_strong_factor','first_max_iterations',
+    'update_max_iterations','noise_stop_factor','plateau_noise_fraction',
+    'block_accepted_updates','patience_blocks','update_block_accepted_updates',
+    'update_patience_blocks','update_plateau_noise_fraction','probe_factors',
+    'plot_reused_records',
+    'plot_gate_updates','plot_gate_reused_records','require_verified_reference',
+    'output_subdirectory',
+)
 
 
 POLICY_KEYS=('update_block_accepted_updates','update_patience_blocks','update_plateau_noise_fraction',
-             'gate_confirm_records','gate_strong_factor','reuse_last_step_limits')
+             'gate_confirm_records','gate_strong_factor')
 EXTRA_KEYS=POLICY_KEYS+('plot_gate_updates','plot_gate_reused_records')
 
 def _policy_digest(s):
@@ -81,7 +82,13 @@ def _adopt_optimizer_policy(state,params):
     state['optimization_revision']=3
 
 def settings(params):
-    return {**deepcopy(DEFAULTS),**params.get('adaptive_inversion',{})}
+    if 'adaptive_inversion' not in params:
+        raise ValueError('Missing explicit params["adaptive_inversion"]')
+    supplied = params['adaptive_inversion']
+    missing, unknown = set(REQUIRED_KEYS) - set(supplied), set(supplied) - set(REQUIRED_KEYS)
+    if missing or unknown:
+        raise ValueError(f'adaptive_inversion: missing={sorted(missing)}, unknown={sorted(unknown)}')
+    return deepcopy(supplied)
 
 
 def enabled(params):
@@ -107,16 +114,30 @@ def prepare_params(params):
 
 
 def validate(params):
-    if not enabled(params):return
     s=settings(params)
+    if not s['enabled']:return
+    if s['gate_metric'] != 'relative_l2':
+        raise ValueError('gate_metric must be relative_l2 to match noise threshold')
+    if s['signal_window_source'] not in ('local','global'):
+        raise ValueError('signal_window_source must be local or global')
+    if int(s['minimum_signal_samples']) < 3:
+        raise ValueError('minimum_signal_samples must be >= 3')
+    if not np.isfinite(s['minimum_signal_energy']) or s['minimum_signal_energy'] < 0:
+        raise ValueError('minimum_signal_energy must be nonnegative')
+    if not 0 < s['independent_lower_bound_fraction'] <= 1:
+        raise ValueError('independent_lower_bound_fraction must lie in (0,1]')
+    if not np.isfinite(s['gate_fallback_noise_multiplier']) or s['gate_fallback_noise_multiplier']<=0:
+        raise ValueError('gate_fallback_noise_multiplier must be positive finite')
     if s['mode'] not in ('sequential','independent'):raise ValueError('adaptive_inversion.mode: sequential or independent required.')
     if s['initial_model'] not in ('homogeneous','local'):raise ValueError('adaptive_inversion.initial_model: homogeneous or local required.')
     if not isinstance(s['gate_enabled'],(bool,np.bool_)):raise ValueError('gate_enabled must be True or False.')
     bound=s['velocity_lower_bound_m_s']
     if bound is not None and (not np.isfinite(bound) or bound<=0):raise ValueError('velocity_lower_bound_m_s must be positive and finite or None.')
-    if not params.get('run_local_inversion',True):
+    if not optimizer_settings(params)['enabled']:
+        raise ValueError('adaptive_noise requires projected L-BFGS: local_optimizer.enabled must be True')
+    if not params['run_local_inversion']:
         raise ValueError('Adaptive inversion requires run_local_inversion=True.')
-    # if float(params.get('local_spectral_gamma',1.))!=1.:
+    # if float(params['local_spectral_gamma'])!=1.:
     #     raise ValueError('Adaptive noise criteria require local_spectral_gamma=1. Disable adaptive_inversion for gamma!=1.')
     if params.get('teeth_bank_enabled',False) or params.get('teeth_continuous_enabled',False):
         raise ValueError('Adaptive inversion is implemented for the original FD/Kelvin-Voigt forward.')
@@ -133,34 +154,22 @@ def validate(params):
 
 
 def _digest(functions,paired_rows,waveform_metadata,stf,params,observed_waveform_data):
-    keys=('local_spectral_gamma','local_objective_taper_fraction','local_update_strategy','reduce_factor',
+    keys=('local_spectral_gamma','local_objective_taper_fraction',
           'frequency_min','frequency_cutoff','embedding_mode','boundary_condition','source_injection',
           'receiver_quantity','absorbing','source_receiver_config','points_per_wavelength',
-          'min_velocity2simulate','max_velocity2simulate','maxtime2simulate',
-          'local_velocity_step_fraction','local_damping_step_fraction',
-          'local_velocity_step_threshold_fraction','local_damping_step_threshold_fraction')
+          'min_velocity2simulate','max_velocity2simulate','maxtime2simulate')
     def encode(v):
         if isinstance(v,np.ndarray):return v.tolist()
         if isinstance(v,np.generic):return v.item()
         if isinstance(v,Path):return str(v)
         raise TypeError(f'Cannot fingerprint {type(v).__name__}')
     science=settings(params)
-    # Preserve fingerprints of existing sequential runs exactly.
-    if science['mode']=='sequential':
-        for key in ('mode','initial_model','velocity_lower_bound_m_s'):science.pop(key,None)
-        if science['gate_enabled']:science.pop('gate_enabled')
-    # Iteration budgets may be raised for a pending reference without changing the objective/criteria.
-    science.pop('first_max_iterations');science.pop('update_max_iterations')
-    # Keep the existing data/objective fingerprint for a documented v1 -> v2 upgrade.
-    # New scientific controls have their own fingerprint in every adaptive state.
-    if science.get('mode')=='independent':
-        # The independent job plan is frozen before the workers run. Its gate
-        # confirmation controls must therefore be part of the plan identity.
-        for key in ('plot_gate_updates','plot_gate_reused_records'):
-            science.pop(key,None)
-    else:
-        for key in EXTRA_KEYS:science.pop(key,None)
-    value={'adaptive':science,'numeric':{k:params.get(k) for k in keys}}
+    for key in ('first_max_iterations','update_max_iterations',
+                'plot_reused_records','plot_gate_updates','plot_gate_reused_records'):
+        science.pop(key)
+    value={'adaptive':science,
+           'numeric':{k:params[k] for k in keys},
+           'local_misfit_duration_us':params['local_misfit_duration_us']}
     if params.get('_adaptive_preselection') is not None:
         value['adaptive_preselection_fingerprint']=params['_adaptive_preselection']['fingerprint']
     # STEEL_REFERENCE_AMPLITUDE_V1
@@ -180,17 +189,56 @@ def _digest(functions,paired_rows,waveform_metadata,stf,params,observed_waveform
     return h.hexdigest()
 
 
-def _masks(simulation,s):
+def local_direct_window(observed_time, assembly, stf_handler, params, compute_travel_time):
+    """One direct-arrival window definition shared by local inversion and gate."""
+    from .inversion_windows import direct_misfit_interval
+    configured = params['local_misfit_duration_us']
+    if configured == 'stf':
+        stf_time = np.asarray(stf_handler.metadata['time_ax_waveform'],dtype=float).reshape(-1)
+        if stf_time.size < 2 or np.any(np.diff(stf_time) <= 0):
+            raise ValueError('STF time axis must be strictly increasing')
+        stf_samples = np.asarray(stf_handler.waveform_data).squeeze()
+        if stf_samples.ndim != 1 or stf_samples.size != stf_time.size:
+            raise ValueError('STF waveform/time axis mismatch (check truncation)')
+        duration = float(stf_time[-1]-stf_time[0])
+    else:
+        duration = float(configured)
+    if not np.isfinite(duration) or duration <= 0:
+        raise ValueError('local_misfit_duration_us must be "stf" or positive µs')
+    arrival = compute_travel_time(assembly_dict=assembly,
+        v_gouge_1=assembly['gouge_velocity_1'],v_gouge_2=assembly['gouge_velocity_2'])
+    indices = direct_misfit_interval(observed_time,arrival_min_us=arrival,
+        arrival_max_us=arrival,stf_duration_us=duration,
+        padding_us=params['direct_window_padding_us'])
+    return indices,duration
+
+
+def _indices_to_mask(time,indices):
+    mask=np.zeros(len(time),dtype=bool)
+    mask[indices]=True
+    return mask
+
+
+def _masks(simulation,s,*,stf_handler=None,params=None,compute_travel_time=None):
     t=np.asarray(simulation.observed_time)
     explicit=s['signal_window_us']
-    if explicit is None:
-        mask=np.zeros(len(t),bool);mask[simulation.misfit_interval]=True
-    else:
+    if explicit is not None:
         a,b=map(float,explicit)
-        if not np.isfinite(a+b) or a>=b or a<t[0] or b>t[-1]:raise ValueError('Invalid signal_window_us.')
+        if not np.isfinite(a+b) or a>=b or a<t[0] or b>t[-1]:
+            raise ValueError('Invalid signal_window_us')
         mask=(t>=a)&(t<=b)
-    if np.count_nonzero(mask)<3:raise ValueError('Adaptive signal window is too short.')
-    noise,_=_noise_window(t,mask,{'noise_enabled':True,'noise_window_us':s['noise_window_us'],'noise_end_us':s['noise_end_us']})
+    elif s['signal_window_source']=='local':
+        if stf_handler is None or params is None or compute_travel_time is None:
+            raise ValueError('local gate window requires STF, params, travel-time function')
+        indices,_=local_direct_window(t,simulation.assembly_dict,stf_handler,
+                                      params,compute_travel_time)
+        mask=_indices_to_mask(t,indices)
+    else:
+        mask=_indices_to_mask(t,simulation.misfit_interval)
+    if np.count_nonzero(mask)<s['minimum_signal_samples']:
+        raise ValueError('Adaptive signal window is too short')
+    noise,_=_noise_window(t,mask,{'noise_enabled':True,
+        'noise_window_us':s['noise_window_us'],'noise_end_us':s['noise_end_us']})
     return mask,noise
 
 
@@ -199,10 +247,10 @@ def _weights(mask,taper):
     return tukey(n,alpha=taper) if taper else np.ones(n)
 
 
-def _levels(data,signal_mask,noise_mask,taper):
+def _levels(data,signal_mask,noise_mask,taper,energy_floor):
     ws,wn=_weights(signal_mask,taper),_weights(noise_mask,taper)
     d=ws*np.asarray(data)[signal_mask];n=wn*np.asarray(data)[noise_mask]
-    if not np.all(np.isfinite(d)) or not np.all(np.isfinite(n)) or float(d@d)<=1e-30 or float(n@n)<=1e-30:
+    if not np.all(np.isfinite(d)) or not np.all(np.isfinite(n)) or float(d@d)<=energy_floor or float(n@n)<=energy_floor:
         raise ValueError('Adaptive thresholds require finite nonzero signal and noise; check preprocessing and windows.')
     return float(d@d),float(n@n),float(ws@ws)/float(wn@wn)
 
@@ -226,13 +274,19 @@ def configure_local_stopping(simulation,params):
             simulation.optimization_resume_state = deepcopy(params.get("_adaptive_resume_monitor"))
         return
     s=settings(params)
-    if hasattr(simulation, 'adaptive_signal_mask'):
-        noise = simulation.adaptive_noise_mask
+    # A gate mask belongs to the reference comparison, NOT the local solver.
+    # Never override simulation.misfit_interval computed by local_refine_waveform.
+    signal=_indices_to_mask(simulation.observed_time,simulation.misfit_interval)
+    if hasattr(simulation,'adaptive_noise_mask'):
+        noise=simulation.adaptive_noise_mask
     else:
-        _, noise = _masks(simulation, s)
+        _,noise=_noise_window(np.asarray(simulation.observed_time),signal,
+            {'noise_enabled':True,'noise_window_us':s['noise_window_us'],
+             'noise_end_us':s['noise_end_us']})
     if params.get('_adaptive_reuse',False):return
-    taper=float(params.get('local_objective_taper_fraction',0.))
-    ed,en,factor=_levels(simulation.observed_waveform,simulation.misfit_interval,noise,taper)
+    taper=float(params['local_objective_taper_fraction'])
+    ed,en,factor=_levels(simulation.observed_waveform,signal,noise,taper,
+                         s['minimum_signal_energy'])
     b=factor*en/ed
     policy=optimizer_settings(params)
     if policy['enabled']:
@@ -258,7 +312,7 @@ def configure_local_stopping(simulation,params):
 
 
 def _reference_threshold(observed,position,rows,data,signal_mask,noise_mask,taper,s):
-    ed,_,factor=_levels(observed,signal_mask,noise_mask,taper)
+    ed,_,factor=_levels(observed,signal_mask,noise_mask,taper,s['minimum_signal_energy'])
     wn=_weights(noise_mask,taper)
     ref=wn*observed[noise_mask]
     values=[]
@@ -266,24 +320,25 @@ def _reference_threshold(observed,position,rows,data,signal_mask,noise_mask,tape
     # No arrival data are used to decide the reference's noise threshold.
     for row in rows[position+1:position+1+int(s['gate_calibration_records'])]:
         sample=wn*np.asarray(data[int(row.uw_idx)])[noise_mask]
-        if np.all(np.isfinite(sample)) and float(sample@sample)>1e-30:
+        if np.all(np.isfinite(sample)) and float(sample@sample)>s['minimum_signal_energy']:
             delta=sample-ref;values.append(factor*float(delta@delta)/ed)
     if values:
         typical=float(np.quantile(values,s['gate_noise_quantile']))
     else:
         # No calibration pairs remain. Conservative independent-noise fallback.
-        _,en,_=_levels(observed,signal_mask,noise_mask,taper)
-        typical=2*factor*en/ed
+        _,en,_=_levels(observed,signal_mask,noise_mask,taper,s['minimum_signal_energy'])
+        typical=s['gate_fallback_noise_multiplier']*factor*en/ed
     return s['gate_noise_factor']*typical,{'samples':len(values),'quantile':s['gate_noise_quantile'],
         'factor':s['gate_noise_factor'],'typical_noise_pair_misfit':typical,
-        'calibration':'first available noise windows after reference; fallback 2*single noise if none remain'}
+        'calibration':'first available noise windows; configured fallback multiplier otherwise',
+        'fallback_multiplier':s['gate_fallback_noise_multiplier']}
 
 
 def gate_decision(reference,current,signal_mask,noise_mask,taper,threshold,objective,s):
-    j=float(objective(reference,current,signal_mask,spectral_gamma=1.,taper_fraction=taper)['total'])
-    ed,_,factor=_levels(reference,signal_mask,noise_mask,taper)
+    j=float(objective(reference,current,signal_mask,spectral_gamma=0.,taper_fraction=taper)['relative_l2'])
+    ed,_,factor=_levels(reference,signal_mask,noise_mask,taper,s['minimum_signal_energy'])
     wn=_weights(noise_mask,taper);n0=wn*reference[noise_mask];n1=wn*current[noise_mask]
-    if not np.all(np.isfinite(n1)) or float(n1@n1)<=1e-30:
+    if not np.all(np.isfinite(n1)) or float(n1@n1)<=s['minimum_signal_energy']:
         raise ValueError('Current noise window is zero or nonfinite; cannot decide model reuse.')
     delta=n1-n0;pair=factor*float(delta@delta)/ed
     # If noise grows, increase the threshold rather than interpreting it as material change.
@@ -295,6 +350,7 @@ def gate_decision(reference,current,signal_mask,noise_mask,taper,threshold,objec
 def _write_row(functions,stream,simulation,assembly,result,state,action,decision,grid_before):
     row=functions['_build_local_result_row'](int(assembly['rec_n']),assembly,simulation,result)
     row.update(result_fields(simulation))
+    row['adaptive_initial_consistency'] = deepcopy(getattr(simulation, 'adaptive_initial_consistency', None))
     row['local_continuation_state']=enrich_local_checkpoint(row['local_continuation_state'],simulation)
     for name in ('_kinematic_reference','_kinematic_cache','kinematic_velocity_m_s','kinematic_arrival_us','kinematic_diagnostics'):
         if hasattr(simulation,name):
@@ -388,13 +444,20 @@ def run_sequence(functions,*,paired_rows,start_position,observed_waveform_data,w
     validate(params);s=settings(params)
     fingerprint=_digest(functions,paired_rows,waveform_metadata,stf_handler,params,observed_waveform_data)
     if state is None:
-        signal,noise=_masks(simulation,s)
+        signal,noise=_masks(simulation,s,stf_handler=stf_handler,params=params,
+            compute_travel_time=functions['compute_dds_travel_time'])
         state={'schema':1,'fingerprint':fingerprint,'signal_mask':signal,'noise_mask':noise,
                'reference_observed':None,'reference_position':None}
     elif state['fingerprint']!=fingerprint:
         raise ValueError('Adaptive resume settings/data selection/STF changed. Restore settings or use a new output folder.')
     _adopt_policy(state,s)
     _adopt_optimizer_policy(state,params)
+    state['effective_configuration']={
+        'adaptive_inversion':settings(params),
+        'local_optimizer':optimizer_settings(params),
+        'local_misfit_duration_us':params['local_misfit_duration_us'],
+        'local_update_strategy':'material_search',
+    }
     simulation.adaptive_signal_mask=state['signal_mask'].copy()
     simulation.adaptive_noise_mask=state['noise_mask'].copy()
     simulation._require_local_model_adjoint_configuration()
@@ -406,6 +469,14 @@ def run_sequence(functions,*,paired_rows,start_position,observed_waveform_data,w
         observed=np.asarray(observed_waveform_data[int(row.uw_idx)])
         if not np.all(np.isfinite(observed[state['signal_mask']])):
             raise ValueError(f'rec_n={assembly["rec_n"]}: nonfinite selected data; no checkpoint written.')
+        simulation.adaptive_previous_accepted_misfit = state.get(
+            'reference_model_misfit',
+            None if getattr(simulation, 'misfit', None) is None else float(simulation.misfit)
+        )
+        simulation.adaptive_reference_observed = (
+            None if state.get('reference_observed') is None
+            else np.asarray(state['reference_observed']).copy()
+        )
         simulation.observed_waveform=observed
         continuing=state.get('pending_position')==position
         first=state['reference_observed'] is None or (continuing and state.get('pending_is_first',False))
@@ -416,7 +487,7 @@ def run_sequence(functions,*,paired_rows,start_position,observed_waveform_data,w
         gate_reference_time=state.get('pending_gate_reference_time_s') if continuing else state.get('reference_time_s')
         if not first and not continuing:
             reuse,decision=gate_decision(state['reference_observed'],observed,state['signal_mask'],state['noise_mask'],
-                float(params.get('local_objective_taper_fraction',0.)),state['reference_threshold'],
+                float(params['local_objective_taper_fraction']),state['reference_threshold'],
                 functions['relative_waveform_objective'],s)
             if s['gate_enabled']:
                 reuse=confirm_gate(state,decision,reuse,s)
@@ -440,15 +511,11 @@ def run_sequence(functions,*,paired_rows,start_position,observed_waveform_data,w
         local_params['_adaptive_reuse']=reuse
         if reuse:local_params['_adaptive_model_origin_rec_n']=int(state['reference_rec_n'])
         local_params['_adaptive_first_reference']=first
-        if not first and not reuse and not continuing and s['reuse_last_step_limits']:
-            learned=reusable_step_limits(state.get('last_step_limits'),params['reduce_factor'])
-            if learned is not None:local_params['_adaptive_resume_limits']=learned
         local_params['n_iterations']=0 if reuse else int(s['first_max_iterations'] if first else s['update_max_iterations'])
         previous_history=[]
         if continuing:
             previous_history=deepcopy(simulation.local_inversion_history)
             local_params['_adaptive_resume_monitor']=state['pending_stopping']['continuation']
-            local_params['_adaptive_resume_limits']=state['pending_stopping']['step_limits']
         assembly['_local_plot_counter']=int(assembly.get('_local_plot_counter',0))+1
         if reuse and not s['plot_reused_records']:
             local_params['plot_save_interval']=10**15
@@ -462,14 +529,13 @@ def run_sequence(functions,*,paired_rows,start_position,observed_waveform_data,w
             simulation.local_inversion_history,_=merge_iteration_history(previous_history,simulation.local_inversion_history)
         if not reuse:
             optimized+=1
-            limits=(simulation.local_stop_diagnostics or {}).get('step_limits')
-            if limits:state['last_step_limits']=deepcopy(limits)
             state['gate_confirmation_count']=0
             threshold,calibration=_reference_threshold(observed,position,paired_rows,observed_waveform_data,
-                state['signal_mask'],state['noise_mask'],float(params.get('local_objective_taper_fraction',0.)),s)
+                state['signal_mask'],state['noise_mask'],float(params['local_objective_taper_fraction']),s)
             state.update(reference_observed=observed.copy(),reference_position=position,reference_rec_n=int(assembly['rec_n']),
                 reference_idx_wave=int(row.uw_idx),reference_time_s=float(row.time_s),reference_threshold=threshold,
                 reference_calibration=calibration,
+                reference_model_misfit=float(simulation.misfit),
                 reference_stop_reason=(simulation.local_stop_diagnostics or {}).get('reason','budget_exhausted'))
             stopping=simulation.local_stop_diagnostics or {}
             state['reference_ready']=bool(stopping.get('converged',state['reference_stop_reason']!='budget_exhausted'))
@@ -552,13 +618,6 @@ def resume_sequence(functions,*,existing_rows,results_pkl,paired_rows,observed_w
             reference={'schema':1,'unavailable_reason':str(error)}
         ensure_reference(simulation,reference)
     state=deepcopy(saved.get('adaptive_state'))
-    if state is not None and 'last_step_limits' not in state:
-        limits=(saved.get('local_stopping') or {}).get('step_limits')
-        if not limits:
-            for previous in reversed(local):
-                limits=previous.get('_retained_step_limits') or (previous.get('local_stopping') or {}).get('step_limits')
-                if limits:break
-        if limits:state['last_step_limits']=deepcopy(limits)
     if state is not None:
         _adopt_policy(state,settings(params))
         previous_optimizer=state.get('optimization_policy_fingerprint')

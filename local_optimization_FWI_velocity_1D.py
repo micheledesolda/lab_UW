@@ -74,10 +74,10 @@ def _global_objective_options(params: Dict[str, Any]) -> Dict[str, float]:
     """Use the existing complete waveform objective in all three global grids."""
     return {
         "spectral_gamma": float(params.get(
-            "global_spectral_gamma", params.get("local_spectral_gamma", 1.0)
+            "global_spectral_gamma", params["local_spectral_gamma"]
         )),
         "objective_taper_fraction": float(params.get(
-            "global_objective_taper_fraction", params.get("local_objective_taper_fraction", 0.0)
+            "global_objective_taper_fraction", params["local_objective_taper_fraction"]
         )),
     }
 
@@ -771,18 +771,18 @@ def compute_dds_travel_time(assembly_dict, v_gouge_1=None, v_gouge_2=None, wave_
 
     t_gouge = h1 / v_gouge_1 + h2 / v_gouge_2
 
-    # t_grooves = (
-    #     groove_dt(side1["h_grooves"], v_s1, v_gouge_1) +
-    #     groove_dt(cent ["h_grooves"], v_sc, v_gouge_1) +
-    #     groove_dt(cent ["h_grooves"], v_sc, v_gouge_2) +
-    #     groove_dt(side2["h_grooves"], v_s2, v_gouge_2)
-    # )
     t_grooves = (
-        side1["h_grooves"]/v_s1 +
-        cent["h_grooves"]/ v_sc +
-        cent["h_grooves"]/ v_sc +
-        side2["h_grooves"]/ v_s2
+        groove_dt(side1["h_grooves"], v_s1, v_gouge_1) +
+        groove_dt(cent ["h_grooves"], v_sc, v_gouge_1) +
+        groove_dt(cent ["h_grooves"], v_sc, v_gouge_2) +
+        groove_dt(side2["h_grooves"], v_s2, v_gouge_2)
     )
+    # t_grooves = (
+    #     side1["h_grooves"]/v_s1 +
+    #     cent["h_grooves"]/ v_sc +
+    #     cent["h_grooves"]/ v_sc +
+    #     side2["h_grooves"]/ v_s2
+    # )
 
     # PZT: if source and receiver are at the centers of the PZTs, total is (w/2 + w/2)/vp = w/vp
     # t_pzt = side1["pzt_layer_width"] / side1["pzt_velocity" + wave_type]
@@ -829,11 +829,7 @@ def _build_local_result_row(
         ),
         "waveform_correlation": objective.get("correlation"),
         "spectral_gamma": objective.get("spectral_gamma"),
-        "local_update_strategy": getattr(
-            simulation,
-            "local_update_strategy",
-            None,
-        ),
+        "local_update_strategy": getattr(simulation, "local_update_strategy", "material_search"),
         "local_iteration_history": list(
             getattr(simulation, "local_inversion_history", [])
         ),
@@ -1707,7 +1703,8 @@ def _rebuild_simulation_from_saved_row(
         stf_handler.metadata["time_ax_waveform"],
         dtype=float,
     )
-    stf_duration = float(stf_time[-1] - stf_time[0])
+
+    stf_duration = float(params["misfit_duration_us"])
     arrival_time = compute_dds_travel_time(
         assembly,
         assembly["gouge_velocity_1"],
@@ -2170,6 +2167,28 @@ def process_uw_file(
         return
     paired = select_mechanical_records(paired, mechanical_dataframe, params, infile_path)
     if paired.empty:
+        return
+
+    # ADAPTIVE_NOISE_PRESELECTION_V2_STAGE
+    from lab_uw.adaptive_preselection import select_and_export
+    selection = select_and_export(globals(), paired=paired,
+        observed_waveform_data=observed_waveform_data, waveform_metadata=waveform_metadata,
+        stf_handler=stf_handler, params=params, assembly_dict=assembly_dict, infile_path=infile_path)
+    if selection is not None:
+        if params["adaptive_noise_preselection"].get("export_only", True):
+            return
+        if (not params.get("source_gain_scan", {}).get("enabled", False)
+                and params.get("adaptive_inversion", {}).get("mode", "sequential") != "independent"):
+            raise ValueError("Continuing from preselected data requires adaptive mode='independent'.")
+        paired = selection["paired"]
+
+    # SOURCE_GAIN_SCAN_V2_STAGE
+    if params.get("source_gain_scan", {}).get("enabled", False):
+        from lab_uw.source_gain_scan import run_selected
+        run_selected(globals(), paired=paired,
+            observed_waveform_data=observed_waveform_data,
+            waveform_metadata=waveform_metadata, stf_handler=stf_handler,
+            params=params, assembly_dict=assembly_dict, infile_path=infile_path)
         return
 
     # MECHANICAL_SELECTION_VISUAL_HOOK_V1
@@ -3808,7 +3827,7 @@ def density_search_run(args):
         ),
         store_wavefield=False,
         source_receiver_config=params["source_receiver_config"],
-        normalize_waveform=True,
+        normalize_waveform=params["normalize_waveform"],
         enable_plotting=enable_plotting,
         make_movie=False,
         plot_output_path=plot_output_path,
@@ -3949,7 +3968,7 @@ def search_common_gouge_density(
         ),
         store_wavefield=False,
         source_receiver_config=params["source_receiver_config"],
-        normalize_waveform=True,
+        normalize_waveform=params["normalize_waveform"],
         enable_plotting=save_plot,
         make_movie=False,
         plot_output_path=best_output_path,
@@ -4041,7 +4060,7 @@ def impedance_material_search_run(args) -> Dict[str, float]:
         points_per_wavelength=int(points_per_wavelength),
         store_wavefield=False,
         source_receiver_config=params["source_receiver_config"],
-        normalize_waveform=True,
+        normalize_waveform=params["normalize_waveform"],
         enable_plotting=plot_output_path is not None,
         make_movie=False,
         plot_output_path=plot_output_path,
@@ -4306,7 +4325,7 @@ def search_joint_impedance_material(
         points_per_wavelength=impedance_ppw,
         store_wavefield=False,
         source_receiver_config=params["source_receiver_config"],
-        normalize_waveform=True,
+        normalize_waveform=params["normalize_waveform"],
         enable_plotting=save_plot,
         make_movie=False,
         plot_output_path=best_output,
@@ -4505,7 +4524,7 @@ def global_search_homogeneus(
 
     # Misfit_interval is choosen according to STF len
     stf_time = stf_handler.metadata["time_ax_waveform"]
-    stf_duration = stf_time[-1]-stf_time[0]  
+    stf_duration = float(params["misfit_duration_us"])
     misfit_interval = direct_misfit_interval(
         observed_time,
         arrival_min_us=windows["direct"][0],
@@ -4647,7 +4666,7 @@ def global_search_homogeneus(
                                       or post_impedance_thickness_enabled
                                   ),
         source_receiver_config  = params["source_receiver_config"],
-        normalize_waveform      = True,
+        normalize_waveform      = params["normalize_waveform"],
         enable_plotting         = save_plot,
         make_movie              = False,
         plot_output_path        = plot_output_global,
@@ -4935,7 +4954,7 @@ def global_search_run(args):
         points_per_wavelength   = params["points_per_wavelength"],
         store_wavefield         = False,
         source_receiver_config  = params["source_receiver_config"],
-        normalize_waveform      = True,
+        normalize_waveform      = params["normalize_waveform"],
         enable_plotting         = True,
         plot_output_path        = all_forward_path,
         **_global_objective_options(params),
@@ -5003,88 +5022,47 @@ def local_refine_waveform(
         movie_output_path = outdir_path_image / f"{outfile_name}.mp4"
     else: movie_output_path = None
 
-    guessed_arrival_time = compute_dds_travel_time(
-        assembly_dict=assembly_dict,
-        v_gouge_1=assembly_dict["gouge_velocity_1"],
-        v_gouge_2=assembly_dict["gouge_velocity_2"],
+    from lab_uw.adaptive_sequence import local_direct_window
+    misfit_interval, stf_duration = local_direct_window(
+        simulation.observed_time, assembly_dict, stf_handler, params,
+        compute_dds_travel_time,
     )
-    # Misfit_interval is choosen according to STF len
-    stf_time = stf_handler.metadata["time_ax_waveform"]
-    stf_duration = stf_time[-1]-stf_time[0]  
-
-    misfit_interval = direct_misfit_interval(
-        simulation.observed_time,
-        arrival_min_us=guessed_arrival_time,
-        arrival_max_us=guessed_arrival_time,
-        stf_duration_us=stf_duration,
-        padding_us=params["direct_window_padding_us"],
-    )
+    # Adaptive data gate is calibrated on one fixed signal window.
+    # Use EXACTLY that window for each local objective as well.
+    if (params['adaptive_inversion']['enabled']
+            and (params['adaptive_inversion']['signal_window_source'] == 'local'
+                 or params['adaptive_inversion']['signal_window_us'] is not None)
+            and hasattr(simulation, 'adaptive_signal_mask')):
+        misfit_interval = np.flatnonzero(simulation.adaptive_signal_mask)
+        if misfit_interval.size == 0:
+            raise ValueError('Adaptive signal window is empty')
     simulation.misfit_interval = misfit_interval
     simulation.assembly_dict = assembly_dict
 
-    # Local inversion hyperparameters
-    dw_max_start = 0*np.amax(simulation.source_handler.time_function)
-    dw_threshold = 0.01 * dw_max_start
-    ds_max_start = 0*np.amax(simulation.source_handler.spatial_function)
-    ds_threshold = 0.01 * ds_max_start
-
-    dc_max_start = float(
-        params.get("local_velocity_step_fraction", 0.02)
-    ) * assembly_dict["gouge_velocity_1"]
-    dc_threshold = float(
-        params.get("local_velocity_step_threshold_fraction", 0.01)
-    ) * dc_max_start
-
-    da_max_start = float(
-        params.get("local_damping_step_fraction", 0.05)
-    ) * assembly_dict["gouge_damping_1"]
-    da_threshold = float(
-        params.get("local_damping_step_threshold_fraction", 0.01)
-    ) * da_max_start
-
+    # Only projected L-BFGS drives the local inversion. Its step sizes,
+    # acceptance and convergence controls live in params["local_optimizer"].
     from lab_uw.adaptive_sequence import configure_local_stopping
     configure_local_stopping(simulation, params)
-    scientific_limits = params.get("_adaptive_resume_limits")
-    if scientific_limits is not None:
-        dc_max_start = float(scientific_limits["dc_max_start"])
-        da_max_start = float(scientific_limits["da_max_start"])
-        dc_threshold = float(scientific_limits["dc_threshold"])
-        da_threshold = float(scientific_limits["da_threshold"])
     simulation.run_local_inversion(
-        n_iterations         = params["n_iterations"],
-        dc_max_start         = dc_max_start,
-        dc_threshold         = dc_threshold,
-        da_max_start         = da_max_start,
-        da_threshold         = da_threshold,
-        dw_max_start         = dw_max_start,
-        dw_threshold         = dw_threshold,
-        stf_duration         = stf_duration,
-        ds_max_start         = ds_max_start,
-        ds_threshold         = ds_threshold,
-        reduce_factor        = params["reduce_factor"],
-        misfit_threshold     = float(params.get("local_misfit_threshold", 1.0e-8)),
-        normalize_waveform   = True,
-        amplitude_scale_mode = "profiled",
-        spectral_gamma       = float(params.get("local_spectral_gamma", 1.0)),
-        objective_taper_fraction=float(
-            params.get("local_objective_taper_fraction", 0.0)
-        ),
-        update_strategy      = str(
-            params.get("local_update_strategy", "alternating")
-        ),
-        enable_plotting      = save_plot,
-        make_movie           = False,
-        plot_output_path     = local_output_path,
-        plot_name_prefix     = outfile_name,
-        movie_output_path    = movie_output_path,
-        retain_wavefield     = bool(params.get("local_retain_wavefield", False)),
+        n_iterations=params["n_iterations"],
+        stf_duration=stf_duration,
+        spectral_gamma=float(params["local_spectral_gamma"]),
+        objective_taper_fraction=float(params["local_objective_taper_fraction"]),
+        update_strategy="material_search",
+        amplitude_scale_mode="profiled",
+        enable_plotting=save_plot,
+        make_movie=False,
+        plot_output_path=local_output_path,
+        plot_name_prefix=outfile_name,
+        movie_output_path=movie_output_path,
+        retain_wavefield=bool(params["local_retain_wavefield"]),
     )
 
     # Diagnose the model that was actually accepted by the local inversion.
     # Compute the scalar for every waveform, but write figures only for the
     # records selected by plot_save_interval.
     local_spectral_result = None
-    if params.get("local_spectral_diagnostics_enabled", True):
+    if params["local_spectral_diagnostics_enabled"]:
         spectral_output_directory = (
             local_output_path
             if record_output_path is not None
@@ -5139,17 +5117,20 @@ if __name__ == "__main__":
     
     # Basic experiment info
     machine_name    = "big_biax"
-    experiment_name = "r0072suw03anhdol_6035"
+    experiment_name = "084"
     wave_type       = "_s"    # that "_" is ugly, but needed
-
+    outfolder_name  = "test_2026-11_16"
+    # outfolder_name += f"_amp={source_amplitude}"
     # ORCHESTRATION_PS_MECHANICAL_SELECTION_V1
     # Modifica wave_type sopra; le impostazioni indipendenti sono raccolte qui.
     polarization_settings = {
         '_s': {
-            'velocity_values_cm_us': np.linspace(0.1100, 0.1500, 16),
-            'impedance_velocity_values_cm_us': np.linspace(0.1100, 0.1500, 16),
-            'damping_values_cm2_us': np.linspace(0.000,0.0005, 15),
-            'impedance_damping_values_cm2_us': np.linspace(0.000,0.0005, 15),
+            'source_amplitude': 2.6,
+            'velocity_values_cm_us': np.linspace(0.1000, 0.1700, 5),
+            'impedance_velocity_values_cm_us': np.linspace(0.1000, 0.1700, 10),
+            'damping_values_cm2_us': np.linspace(0.000,0.0005, 5),
+            'impedance_damping_values_cm2_us': np.linspace(0.000,0.0005, 10),
+            "impedance_density_values_g_cm3": np.linspace(1.8, 3.2, 10),
             'minimum_velocity_cm_us': 0.08,
             'maximum_velocity_cm_us': 0.33,
             'waveform_duration_us': 25,
@@ -5160,15 +5141,20 @@ if __name__ == "__main__":
             'stf_h5_path': None,  # oppure un percorso HDF5 esplicito
             'stf_name': 's_70V_100nm',
             'stf_cycle_index': 0,
-            'stf_truncate_us': 4,
+            'stf_truncate_us': 4.,
+            'misfit_duration_us':4,
+            'local_misfit_duration_us':4,
             'uw_basename': '006_reload_ss_1_S',  # None: tutti i file
         },
         '_p': {
-            'velocity_values_cm_us': np.linspace(0.1600, 0.2000, 15),
-            'impedance_velocity_values_cm_us': np.linspace(0.1600, 0.2000, 15),
-            'damping_values_cm2_us': np.linspace(0.0005, 0.0009, 15),
-            'impedance_damping_values_cm2_us': np.linspace(0.0005, 0.0009, 15),
-            'minimum_velocity_cm_us': 0.15,
+            'source_amplitude': 9,
+            'velocity_values_cm_us': np.linspace(0.1600, 0.2600, 10),
+            'impedance_velocity_values_cm_us': np.linspace(0.1600, 0.2600, 10),
+            'damping_values_cm2_us': np.linspace(0.0008, 0.002, 10),
+            'impedance_damping_values_cm2_us': np.linspace(0.0008, 0.002, 10),
+            "impedance_density_values_g_cm3": np.linspace(1.8, 3.2, 10),
+
+            'minimum_velocity_cm_us': 0.08,
             'maximum_velocity_cm_us': 0.62,
             'waveform_duration_us': 16,
             'frequency_min_mhz': 0.1,
@@ -5179,6 +5165,8 @@ if __name__ == "__main__":
             'stf_name': 'p_70V_100nm',
             'stf_cycle_index': 0,
             'stf_truncate_us': 4,
+            'misfit_duration_us':0.3,
+            'local_misfit_duration_us':4,
             'uw_basename': '005_reload_ss_1_P',  # None: tutti i file
         },
     }
@@ -5189,7 +5177,7 @@ if __name__ == "__main__":
     polarization = validate_polarization(wave_type, polarization_settings)
     selected_uw_basename = polarization['uw_basename']
     mechanical_selection = {
-        'enabled': False,
+        'enabled': True,
         'time_interval_s': None,  # None: scegli sul grafico la prima volta
         'reselect': False,  # True: scegli nuovamente il tratto
         'selection_file': (dir_manager.paths.analysis_root(machine_name, experiment_name)
@@ -5200,31 +5188,12 @@ if __name__ == "__main__":
     data_type_uw    = "uw_data/data_tsv_files" + wave_type
     data_type_mech  = "mechanical_data"
     mech_file_name  = f"{experiment_name}_data_rp"
-    # PROFILED_SOURCE_AMPLITUDE_V1
-    # La scala viene adattata sui dati per ogni modello globale/locale.
-    # Il moltiplicatore di partenza puo rimanere uno.
-    source_amplitude = 1.0
-    if not np.isfinite(source_amplitude) or source_amplitude <= 0.0:
-        raise ValueError("source_amplitude deve essere finita e positiva")
-    outfolder_name  = "test_2026-10-23_gamma1_gamma1_joint_adaptive_noise_SNR_3_run_in_FULL"
-    outfolder_name += "_density_local"
-    outfolder_name += "_profiled_amp_global_local"
 
-    # Create output directories
-    outdir_path_l2norm = dir_manager.make_data_analysis_folders(
-        machine_name    = machine_name,
-        experiment_name = experiment_name,
-        data_types      = [outfolder_name]
-    )
-
-    outdir_path_image = dir_manager.make_data_analysis_folders(
-        machine_name    = machine_name,
-        experiment_name = experiment_name,
-        data_types      = [outfolder_name + "_images_and_movie"]
-    )
 
     # Basic simulation parameters 
     params = {
+        "impedance_density_values_g_cm3": polarization["impedance_density_values_g_cm3"],
+        "normalize_waveform"        : False,
         "absorbing"                 : False,
         "embedding_mode"            : "effective_surface",
         "boundary_condition"        : "free",
@@ -5232,7 +5201,7 @@ if __name__ == "__main__":
         "receiver_quantity"         : "velocity",
         # Keep the broad homogeneous search cheap; the small diagnostic
         # thickness search can use a finer grid in receiver-only mode.
-        "points_per_wavelength"     : 8,
+        "points_per_wavelength"     : 4,
         "source_receiver_config"    : {
             "interpolation_radius_cells": 4,
             "source_extension_cm": 0.0,
@@ -5242,88 +5211,13 @@ if __name__ == "__main__":
             "spatial_boundary_mode": "truncate",
         },
         "frequency_min"             : polarization['frequency_min_mhz'],
-        "direct_window_padding_us"  : 0.25,
+        "direct_window_padding_us"  : 0.1,
         "diagnostic_plot_only"      : False,
-        # The earlier kinematic diagnostics remain available, but are silent
-        # during the common-material impedance search below.  Thus c1=c2,
-        # rho1=rho2 and the two measured gouge thicknesses remain fixed.
-        "velocity_contrast_search_enabled": False,
-        "velocity_contrast_points_per_wavelength": 8,
-        "velocity_contrast_log_values": np.linspace(-0.10, 0.10, 11),
-        "velocity_contrast_plot_all": False,
-        "gouge_thickness_search_enabled": False,
-        "gouge_thickness_points_per_wavelength": 8,
-        "gouge_thickness_offset_mm_values": np.linspace(-0.2, 0.2, 40),
-        "gouge_thickness_plot_all": False,
-        "gouge_thickness_tie_relative_tolerance": 1.0e-6,
-        "joint_kinematic_search_enabled": False,
-        "joint_kinematic_points_per_wavelength": 8,
-        # If omitted, the joint search reuses the two arrays above.
-        # "joint_kinematic_log_values": np.linspace(-0.10, 0.10, 11),
-        # "joint_kinematic_offset_mm_values": np.linspace(-0.05, 0.05, 11),
-        "joint_kinematic_plot_all": False,
-        # Legacy one-dimensional density-only diagnostic (kept available).
-        "density_search_enabled": False,
-        "density_search_points_per_wavelength": 8,
-        "steel_density_g_cm3": 7.8,
-        "gouge_density_values_g_cm3": np.linspace(1.4, 2.5, 23),
-        "density_search_plot_all": False,
-        # Joint material workflow:
-        # 1) the historical rho-normalised homogeneous c/damping grid above is
-        #    retained as a baseline;
-        # 2) coarse physical-impedance grid at 4 PPW;
-        # 3) J_gamma and D_f are stored separately, and only J_gamma selects
-        #    the model at this stage (with the configured global gamma).
+
         "impedance_material_search_enabled": True,
-        # Additional elastic c/rho grid, with nu fixed to zero everywhere.
-        # Reuses the impedance velocity/density arrays and PPW below.
-        # With both searches enabled, save their comparison and continue
-        # locally from the KV model. For elastic-only global runs, also set
-        # impedance_material_search_enabled=False and run_local_inversion=False.
-        "elastic_material_search_enabled": False,
-        # Bank-only global search: exact 5 x 10 x 4 material grid, no new FEM.
-        # Extract all original matrix archives into this directory, or set
-        # LAB_UW_TEETH_BANK to an absolute matrices/ path before launching.
-        "teeth_bank_enabled": False,
-        "teeth_bank": {
-            "directory": os.environ.get("LAB_UW_TEETH_BANK", str(
-                Path(__file__).resolve().parents[1] / "teeth_parameter_sweep" / "matrices")),
-            "frequency_interpolation": "linear",
-            "fft_padding_factor": 8,
-            "periodic_tail_factor": 1e-4,
-            "time_oversampling": 1,
-            "lateral_offsets_mm": [0., 0., 0., 0.],
-            "use_bank_metal_properties": True,
-        },
-        # Continuous material operator. Velocity is cS for _s, cP for _p.
-        # Poisson and the FD-unit bulk damping are distinct parameters.
-        "teeth_continuous_enabled": False,
-        "teeth_continuous": {
-            "model_directory": os.environ.get("LAB_UW_TEETH_CONTINUOUS"),
-            "backend": "reduced",
-            "density_values_g_cm3": np.linspace(1.5, 3.0, 5),
-            "velocity_values_cm_us": (np.linspace(0.1100, 0.1600, 11) if wave_type=="_s"
-                                      else np.linspace(0.2000, 0.2800, 11)),
-            "poisson_values": [0.15, 0.20, 0.30],
-            "bulk_damping_values_cm2_us": np.linspace(0.0000, 0.0009, 10),
-            "bulk_damping_law": "constant_poisson_kelvin_voigt",
-            "frequency_evaluation": "cubic",
-            "frequency_step_mhz": 0.025,
-            "fft_padding_factor": 8,
-            "periodic_tail_factor": 1e-4,
-            "time_oversampling": 1,
-            "lateral_offsets_mm": [0., 0., 0., 0.],
-            "use_bank_metal_properties": True,
-            "workers": 5,
-            "blas_threads": 1,
-            "cache_materials": 1,
-            "full_refinement_top_k": 3,
-            "plot_all_candidates": False,
-        },
-        "impedance_points_per_wavelength": 8,
+        "impedance_points_per_wavelength": 4,
         "impedance_velocity_values_cm_us": polarization['impedance_velocity_values_cm_us'],
         "impedance_damping_values": polarization['impedance_damping_values_cm2_us'],
-        "impedance_density_values_g_cm3": np.linspace(1.8, 2.9, 12),
         # Once the common material is fixed, redistribute only the measured
         # total gouge thickness.  With c1=c2 this cannot alter the direct
         # travel time; it tests only the relative timing of internal echoes.
@@ -5335,8 +5229,8 @@ if __name__ == "__main__":
         # record k starts from the accepted model at k-3 in its chain.  A
         # worker lives for at most three records, then a fresh process resumes
         # from the compact accepted-model checkpoint of the preceding chunk.
-        "local_inversion_workers": 10,
-        "local_anchor_stride": 10,
+        "local_inversion_workers": 1,
+        "local_anchor_stride": 1,
         "local_records_per_worker": 1,
         # Reuse the append-only result stream after an interruption. Legacy
         # pickles without explicit checkpoints are reconstructed from their
@@ -5347,25 +5241,83 @@ if __name__ == "__main__":
         # region.  Small initial steps are appropriate around the refined
         # global minimum.
         "run_local_inversion"      : True,
-        "local_velocity_step_fraction": 0.02,
-        "local_velocity_step_threshold_fraction": 0.01,
-        "local_damping_step_fraction": 0.05,
-        "local_damping_step_threshold_fraction": 0.01,
+        # Local direct window: "stf" uses the exact STF time-axis duration;
+        # otherwise give a positive duration in microseconds.
+        "local_misfit_duration_us": polarization["local_misfit_duration_us"],        # Material optimizer: independent of normalized-gradient dc_max/da_max.
+        "local_optimizer": {
+            "enabled": True,
+            "parameterization": "modulus_viscosity",
+            "invert_density": True,
+            "density_bounds_g_cm3": None,
+            "memory": 8,
+            "initial_fraction": 0.02,
+            "armijo": 1e-4,
+            "backtracks": 18,
+            "expansions": 6,
+            "backtrack_factor": 0.5,
+            "expansion_factor": 2.0,
+            "lbfgs_initial_alpha": 1.0,
+            "minimum_gain_absolute": 1e-3,  # rescue scale only, NOT convergence
+            "minimum_gain_relative": 1e-5,
+            "weak_cycles": 2,
+            "projected_gradient_tolerance": 1e-9,
+            "material_scale_floor": 1e-8,
+            "bound_projection_tolerance": 1e-14,
+            "curvature_absolute_tolerance": 1e-14,
+            "curvature_relative_tolerance": 1e-10,
+            "descent_direction_tolerance": 1e-16,
+            "direction_norm_floor": 1e-30,
+            "checkpoint_search_history": 20,
+            "velocity_lower_bound_fraction": 0.25,
+            "forward_consistency_rtol": 1e-8,
+            "forward_consistency_atol": 1e-12,
+        },
+        # Adaptive noise: values are specified HERE, never supplied in modules.
+        "adaptive_inversion": {
+            "enabled": True,
+            "mode": "sequential",            # sequential / independent
+            "initial_model": "local",         # independent seed
+            "velocity_lower_bound_m_s": None,
+            "independent_lower_bound_fraction": 0.25,
+            "gate_enabled": True,
+            "gate_metric": "relative_l2",    # consistent with noise calibration
+            "signal_window_source": "local", # local / global
+            "signal_window_us": None,         # explicit bounds override source
+            "minimum_signal_samples": 3,
+            "minimum_signal_energy": 1e-30,
+            "noise_window_us": None,
+            "noise_end_us": 10.0,
+            "gate_noise_quantile": 0.99,
+            "gate_noise_factor": 1.25,
+            "gate_calibration_records": 200,
+            "gate_fallback_noise_multiplier": 2.0,
+            "gate_confirm_records": 2,
+            "gate_strong_factor": 2.0,
+            "first_max_iterations": 500,
+            "update_max_iterations": 500,
+            "noise_stop_factor": 1.5,
+            "plateau_noise_fraction": 0.1,
+            "block_accepted_updates": 20,
+            "patience_blocks": 3,
+            "update_block_accepted_updates": 10,
+            "update_patience_blocks": 1,
+            "update_plateau_noise_fraction": 1.0,
+            "probe_factors": [2.0, 0.5],
+            "plot_reused_records": False,
+            "plot_gate_updates": True,
+            "plot_gate_reused_records": False,
+            "require_verified_reference": True,
+            "output_subdirectory": "adaptive_noise",
+        },
         # Global and local candidates each fit one amplitude scalar.
         # gamma=1 is the relative L2 objective, required by local profiling;
         # larger values explicitly upweight spectral-energy shape.
-        "local_spectral_gamma": 1.0,
+        "local_spectral_gamma": 0.0,
         # All three global grids use the same complete J_gamma objective.
         # Omit these keys to inherit the corresponding local settings.
-        "global_spectral_gamma": 1.0,
+        "global_spectral_gamma": 0.0,
         "global_objective_taper_fraction": 0.0,
         "local_objective_taper_fraction": 0.0,
-        "local_misfit_threshold": 1.0e-2,
-        # "alternating" accepts velocity and damping in separate iterations.
-        # Use "cross_talk" on a diagnostic subset to evaluate velocity-only,
-        # damping-only and joint proposals at every iteration.  "joint"
-        # reproduces the historical coupled acceptance rule.
-        "local_update_strategy": "joint",
         # D_f is computed for every local result.  The two spectral figures
         # follow plot_save_interval to avoid generating one folder per record.
         "local_spectral_diagnostics_enabled": True,
@@ -5383,10 +5335,9 @@ if __name__ == "__main__":
         "plot_save_interval"        : 1,
         "movie_save_interval"       : 15000,
         "l2norm_plot"               : True,
-        "outdir_path_l2norm"        : outdir_path_l2norm[0],
-        "outdir_path_image"         : outdir_path_image[0],
+        # "outdir_path_l2norm"        : outdir_path_l2norm[0],
+        # "outdir_path_image"         : outdir_path_image[0],
         "n_iterations"              : 80,
-        "reduce_factor"             : 10/9,
 
         # densita', stimate
         "steel_density_g_cm3": 7.85,
@@ -5395,47 +5346,14 @@ if __name__ == "__main__":
         "side2_density_g_cm3": 7.85,
     }
 
-    # LOCAL_DENSITY_INVERSION_V1
-    params.setdefault("local_optimizer", {}).setdefault("invert_density", True)
-    # None: usa gli estremi di impedance_density_values_g_cm3 (o gouge_density_values_g_cm3).
-    params["local_optimizer"].setdefault("density_bounds_g_cm3", None)
-
-    params.setdefault("local_optimizer", {})["minimum_gain_absolute"] = 1e-4
-    params.setdefault("adaptive_inversion", {}).update({
-    "gate_noise_factor": 0.75,
-    "gate_confirm_records": 1,
-})
+    # SET MISFIT
+    params["misfit_duration_us"] = polarization["misfit_duration_us"]
     
-    # Adaptive mode uses one chronological reference; global worker settings remain valid.
-    params['adaptive_inversion'] = {
-        'enabled': True,
-        'output_subdirectory': 'adaptive_noise',
-        'first_max_iterations': 500,
-        'update_max_iterations': 500,
-        'signal_window_us': None,
-        'noise_window_us': None,
-        'noise_end_us': 10.,
-        'gate_noise_quantile': 0.99,
-        'gate_noise_factor': 1.25,
-        'gate_calibration_records': 200,
-        'noise_stop_factor': 1.5,
-        'plateau_noise_fraction': 0.1,
-        'block_accepted_updates': 20,
-        'patience_blocks': 3,
-        'probe_factors': [2., 0.5],
-        'plot_reused_records': False,
-        'require_verified_reference': True,
-    }
-
-    # LOCAL_MATERIAL_COORDINATES_V1_CONFIG
-    # Ingressi e grafici restano in velocita e damping; densita fissa nel locale.
-    params.setdefault("local_optimizer", {}).setdefault("parameterization", 'modulus_viscosity')
-
-    # ADAPTIVE_INDEPENDENT_CONFIGURATION_V1
-    # Ogni onda parte dallo stesso modello della prima acquisizione.
-    params["adaptive_inversion"].setdefault("mode", "independent")
-    params["adaptive_inversion"].setdefault("initial_model", "local")  # oppure "homogeneous"
-    params["adaptive_inversion"].setdefault("velocity_lower_bound_m_s", None)
+    # Validate complete explicit configuration before processing data.
+    from lab_uw.adaptive_sequence import validate as validate_adaptive_config
+    from lab_uw.material_optimizer import settings as validate_material_config
+    validate_material_config(params)
+    validate_adaptive_config(params)
 
     # Grafico delle differenze tra dati, dopo la GUI e prima di ogni inversione.
     params['wave_difference_diagnostic'] = {
@@ -5444,12 +5362,15 @@ if __name__ == "__main__":
         'window_us': None,  # None: finestra iniziale del misfit globale; oppure (inizio, fine)
         'spectral_gamma': None,  # None: usa local_spectral_gamma
         'taper_fraction': None,  # None: usa local_objective_taper_fraction
+        'noise_enabled': True,
+        'noise_window_us': None,
+        'noise_end_us': 10.0,
     }
 
     # MECHANICAL_SELECTION_VISUAL_CONFIG_V1
     params["mechanical_selection_inspection"] = {
         "enabled": True,
-        "only": True,  # True: salva le figure e termina prima dell'inversione
+        "only": False,  # True: salva le figure e termina prima dell'inversione
         "script_path": None,  # None: visual_ispection_standard.py accanto a questo file
         "window_us": None,  # None: stessa finestra iniziale dell'inversione
         "save_pdf": False,
@@ -5459,28 +5380,31 @@ if __name__ == "__main__":
         "map_max_rows": 1024,
     }
 
-    # SUCCESSIVE_WAVES_NOISE_V2
-    params['wave_difference_diagnostic'].setdefault('noise_enabled', True)
-    params['wave_difference_diagnostic'].setdefault('noise_window_us', None)  # oppure (6., 10.)
-    params['wave_difference_diagnostic'].setdefault('noise_end_us', 10.)  # None sopra: stessa durata del segnale
     params['mechanical_selection'] = mechanical_selection
 
     # ORCHESTRATION_SAME_WAVE_RESTART_V2
     params['local_restart'] = {
         'enabled': False,  # True: altre iterazioni sulla stessa onda salvata
         'pickle_path': None,  # None: pickle nella cartella di output attuale
-        'rec_n': 248338,  # None: ultimo risultato locale completato; oppure il record
+        'rec_n': None,  # None: ultimo risultato locale completato; oppure il record
         'additional_iterations': 40,
         'output_directory': None,  # None: local_continuations accanto al pickle sorgente
         'reuse_last_step_limits': True,
         'misfit_interval_us': None,  # solo per vecchi checkpoint senza finestra recuperabile
     }
 
-    # Scala adattata sui dati nel globale e nel locale; riattiva le inversioni.
-    params["source_receiver_config"]["source_amplitude"] = source_amplitude
-    params["global_spectral_gamma"] = 1.0
-    params["local_spectral_gamma"] = 1.0
-    params["run_local_inversion"] = True
+    # # Scala adattata sui dati nel globale e nel locale; riattiva le inversioni.
+    # params["source_receiver_config"]["source_amplitude"] = source_amplitude
+    # params["global_spectral_gamma"] = 1.0
+    # params["local_spectral_gamma"] = 1.0
+    # params["run_local_inversion"] = True
+
+    # ADAPTIVE_NOISE_PRESELECTION_V1_CONFIG
+    # Usa le impostazioni adaptive_inversion gia' definite sopra.
+    params["adaptive_noise_preselection"] = {
+        "enabled": True,
+        "export_only": True,  # esporta onde e meccanica selezionate, poi termina
+    }
 
     # Load the Source Time Function (HDF5)
     stf_h5_path = (
@@ -5507,7 +5431,12 @@ if __name__ == "__main__":
         )
 
         ########### HO MESSO UN TRONCAMENTO ARBITRATIO A 4 MUS #####################
-        stf_handler.waveform_data = stf_handler.truncate_time(polarization['stf_truncate_us']).waveform_data.squeeze(0)   # shape (L,) e c'e' anche un troncamento
+        truncated_stf = stf_handler.truncate_time(polarization['stf_truncate_us'])
+        stf_handler.waveform_data = np.asarray(truncated_stf.waveform_data).squeeze()
+        # Time axis must describe the SAME samples as the injected STF.
+        stf_handler.metadata['time_ax_waveform'] = np.asarray(
+            truncated_stf.metadata['time_ax_waveform'], dtype=float
+        ).copy()
     # plt.plot(stf_handler.metadata['time_ax_waveform'], stf_handler.waveform_data)
     # plt.show()
     # sys.exit()
@@ -5515,18 +5444,6 @@ if __name__ == "__main__":
     # Load Mechanical Data
     mech_folder = Path(dir_manager.base_dir) / f"experiments_{machine_name}" / experiment_name / data_type_mech
     mech_data, sync_data, sync_peaks = MechanicalDataHandler.find_and_load(mech_folder, mech_file_name)
-
-    # print(mech_data.head(5))
-    # sys.exit()
-    # check sync with mech data
-    # f, ax = plt.subplots()
-    # ax.plot(mech_data.shear_stress_MPa, c='r')
-    # ax.plot(mech_data.normal_stress_MPa, c='g')
-    # ax1 = ax.twinx()
-    # ax1.vlines(sync_peaks[2]+13000,ymin=0,ymax=5)
-    # ax1.plot(mech_data.sync, c='k')
-    # plt.show()
-    # sys.exit()
 
 
     # Build a dictionary containing all the relevant assembly parameters
@@ -5553,7 +5470,7 @@ if __name__ == "__main__":
     
     # Make UW path list
     infile_path_list_uw = sorted( dir_manager.make_infile_path_list(machine_name, experiment_name, data_type=data_type_uw))
- 
+
     # Process each UW file
     for chosen_uw_file, infile_path in enumerate(infile_path_list_uw):
         infile_name = infile_path.name.split(".")[0]
@@ -5563,10 +5480,13 @@ if __name__ == "__main__":
             continue
 
         mech_data_slice = mechdata_slice4uw_processing(mech_data,
-                                                       sync_peaks, 
-                                                       chosen_uw_file, 
-                                                       num_waveform2process=preprocessing_waveform_count(params))
-
+                                                    sync_peaks, 
+                                                    chosen_uw_file, 
+                                                    num_waveform2process=preprocessing_waveform_count(params))
+        # # print(mech_data_slice.head(5))
+        # plt.plot(mech_data_slice["rgt_lt_mm"])
+        # plt.show()
+        # sys.exit()
         # Load & process ultrasonic data and metadata from TSV, with preprocessing
         # STEEL_REFERENCE_AMPLITUDE_V1
         if stf_handler.metadata.get('source_calibration') is not None:
@@ -5586,47 +5506,33 @@ if __name__ == "__main__":
                     )
             )
 
- 
-        # # Diagnostica sincronizzazione: stampa solo pochi numeri
-        # _tu = np.asarray(uw_data_handler.metadata["time_ax_acquisition"], dtype=float)
-        # _tm = np.asarray(mech_data["time_s"], dtype=float)
-        # _sy = np.asarray(mech_data["sync"], dtype=float)
-        # _p0, _p1 = map(int, sync_peaks[2*chosen_uw_file:2*chosen_uw_file+2])
-        # _t0 = float(mech_data_slice["time_s"].iloc[0])
+        # PROFILED_SOURCE_AMPLITUDE_V1
+        # La scala viene adattata sui dati per ogni modello globale/locale.
+        source_amplitude = polarization["source_amplitude"]
+        params["source_receiver_config"]["source_amplitude"] = source_amplitude
 
-        # print("SYNC FILE:", infile_path.name, "posizione:", chosen_uw_file)
-        # print("SYNC ELENCO FILE:", [p.name for p in infile_path_list_uw])
-        # print("SYNC UW: numero, primo, ultimo, passo_mediano:",
-        #       len(_tu), _tu[0], _tu[-1], np.median(np.diff(_tu)))
-        # print("SYNC UNITA UW:",
-        #       uw_data_handler.metadata.get("time_ax_acquisition_unit", "non dichiarata"))
-        # print("SYNC MECC: numero_sync, indici, tempi:",
-        #       len(sync_peaks), (_p0, _p1), (_tm[_p0], _tm[_p1]))
-        # print("SYNC DURATE: UW, fra_sync_meccanici:",
-        #       _tu[-1] - _tu[0], _tm[_p1] - _tm[_p0])
-        # print("SYNC MAPPATURA: origine_usata, fine_UW_assegnata, scarto_dal_sync_finale:",
-        #       _t0, _t0 + _tu[-1], _t0 + _tu[-1] - _tm[_p1])
+        if not np.isfinite(source_amplitude) or source_amplitude <= 0.0:
+            raise ValueError("source_amplitude deve essere finita e positiva")
 
-        # # Descrive anche la larghezza dei due impulsi.
-        # for _nome, _p in (("inizio", _p0), ("fine", _p1)):
-        #     _livello = 0.5 * _sy[_p]
-        #     _sinistra = _destra = _p
-        #     while _sinistra > 0 and _sy[_sinistra-1] >= _livello:
-        #         _sinistra -= 1
-        #     while _destra < len(_sy)-1 and _sy[_destra+1] >= _livello:
-        #         _destra += 1
-        #     print("SYNC IMPULSO:", _nome,
-        #           "livello_meta_picco:", _livello,
-        #           "tempi_primo_sopra_soglia/picco/ultimo_sopra_soglia:",
-        #           (_tm[_sinistra], _tm[_p], _tm[_destra]))
-        # meta = uw_data_handler.metadata
-        
-        # print("SYNC HEADER:", meta.get("raw_header"))
-        # print(
-        #     "SYNC RIGHE: lette, attese:",
-        #     meta.get("number_of_waveforms"),
-        #     meta.get("expected_number_of_waveforms"),
-        # )
+
+
+        # Create output directories
+        outdir_path_l2norm = dir_manager.make_data_analysis_folders(
+            machine_name    = machine_name,
+            experiment_name = experiment_name,
+            data_types      = [outfolder_name]
+        )
+
+        outdir_path_image = dir_manager.make_data_analysis_folders(
+            machine_name    = machine_name,
+            experiment_name = experiment_name,
+            data_types      = [outfolder_name + "_images_and_movie"]
+        )
+
+        params["outdir_path_l2norm"] = outdir_path_l2norm[0]
+        params["outdir_path_image"]  = outdir_path_image[0]
+
+
         if not params["diagnostic_plot_only"]:
             process_uw_file(
                 infile_path=infile_path,
@@ -5637,3 +5543,102 @@ if __name__ == "__main__":
                 assembly_dict=assembly_dict,
             )
             continue
+
+
+## altre configurazioni che al momento fanno solo casino nel ricordami che sto facendo
+
+            # # The earlier kinematic diagnostics remain available, but are silent
+            # # during the common-material impedance search below.  Thus c1=c2,
+            # # rho1=rho2 and the two measured gouge thicknesses remain fixed.
+            # "velocity_contrast_search_enabled": False,
+            # "velocity_contrast_points_per_wavelength": 8,
+            # "velocity_contrast_log_values": np.linspace(-0.10, 0.10, 11),
+            # "velocity_contrast_plot_all": False,
+            # "gouge_thickness_search_enabled": False,
+            # "gouge_thickness_points_per_wavelength": 8,
+            # "gouge_thickness_offset_mm_values": np.linspace(-0.2, 0.2, 40),
+            # "gouge_thickness_plot_all": False,
+            # "gouge_thickness_tie_relative_tolerance": 1.0e-6,
+            # "joint_kinematic_search_enabled": False,
+            # "joint_kinematic_points_per_wavelength": 8,
+            # # If omitted, the joint search reuses the two arrays above.
+            # # "joint_kinematic_log_values": np.linspace(-0.10, 0.10, 11),
+            # # "joint_kinematic_offset_mm_values": np.linspace(-0.05, 0.05, 11),
+            # "joint_kinematic_plot_all": False,
+            # # Legacy one-dimensional density-only diagnostic (kept available).
+            # "density_search_enabled": False,
+            # "density_search_points_per_wavelength": 8,
+            # "steel_density_g_cm3": 7.8,
+            # "gouge_density_values_g_cm3": np.linspace(1.4, 2.5, 23),
+            # "density_search_plot_all": False,
+            # # Joint material workflow:
+            # # 1) the historical rho-normalised homogeneous c/damping grid above is
+            # #    retained as a baseline;
+            # # 2) coarse physical-impedance grid at 4 PPW;
+            # # 3) J_gamma and D_f are stored separately, and only J_gamma selects
+            # #    the model at this stage (with the configured global gamma).
+            # # Additional elastic c/rho grid, with nu fixed to zero everywhere.
+            # # Reuses the impedance velocity/density arrays and PPW below.
+            # # With both searches enabled, save their comparison and continue
+            # # locally from the KV model. For elastic-only global runs, also set
+            # # impedance_material_search_enabled=False and run_local_inversion=False.
+            # "elastic_material_search_enabled": False,
+            # # Bank-only global search: exact 5 x 10 x 4 material grid, no new FEM.
+            # # Extract all original matrix archives into this directory, or set
+            # # LAB_UW_TEETH_BANK to an absolute matrices/ path before launching.
+            # "teeth_bank_enabled": False,
+            # "teeth_bank": {
+            #     "directory": os.environ.get("LAB_UW_TEETH_BANK", str(
+            #         Path(__file__).resolve().parents[1] / "teeth_parameter_sweep" / "matrices")),
+            #     "frequency_interpolation": "linear",
+            #     "fft_padding_factor": 8,
+            #     "periodic_tail_factor": 1e-4,
+            #     "time_oversampling": 1,
+            #     "lateral_offsets_mm": [0., 0., 0., 0.],
+            #     "use_bank_metal_properties": True,
+            # },
+            # # Continuous material operator. Velocity is cS for _s, cP for _p.
+            # # Poisson and the FD-unit bulk damping are distinct parameters.
+            # "teeth_continuous_enabled": False,
+            # "teeth_continuous": {
+            #     "model_directory": os.environ.get("LAB_UW_TEETH_CONTINUOUS"),
+            #     "backend": "reduced",
+            #     "density_values_g_cm3": np.linspace(1.5, 3.0, 5),
+            #     "velocity_values_cm_us": (np.linspace(0.1100, 0.1600, 11) if wave_type=="_s"
+            #                             else np.linspace(0.2000, 0.2800, 11)),
+            #     "poisson_values": [0.15, 0.20, 0.30],
+            #     "bulk_damping_values_cm2_us": np.linspace(0.0000, 0.0009, 10),
+            #     "bulk_damping_law": "constant_poisson_kelvin_voigt",
+            #     "frequency_evaluation": "cubic",
+            #     "frequency_step_mhz": 0.025,
+            #     "fft_padding_factor": 8,
+            #     "periodic_tail_factor": 1e-4,
+            #     "time_oversampling": 1,
+            #     "lateral_offsets_mm": [0., 0., 0., 0.],
+            #     "use_bank_metal_properties": True,
+            #     "workers": 5,
+            #     "blas_threads": 1,
+            #     "cache_materials": 1,
+            #     "full_refinement_top_k": 3,
+            #     "plot_all_candidates": False,
+            # },
+
+
+        # # SOURCE_GAIN_SCAN_V1_CONFIG
+        # # Diagnostica separata: ogni mappa mantiene a fisso.
+        # params["source_gain_scan"] = {
+        #     "enabled": True,
+        #     "record_numbers": [None],  # None: prima onda selezionata
+        #     "gain_values": np.unique(np.r_[np.geomspace(0.1, 20.0, 41), 1.0]),
+        #     "velocity_points": 10,
+        #     "damping_points": 10,
+        #     "density_values_g_cm3": np.linspace(1.8, 2.9, 12),  # identica per P e S
+        #     "window_us": None,  # stessa finestra automatica del globale
+        #     "plot_maps": True,
+        #     "export_only": False,  # True: esporta solo il piccolo NPZ da eseguire altrove
+        #     # PPW eredita impedance_points_per_wavelength; griglia FD invariata.
+        # }
+        # # Facoltativo: percorso della sorgente calibrata attraverso l'ambiente.
+        # _scan_source = os.environ.get("LAB_UW_CALIBRATED_SOURCE_" + wave_type.strip("_").upper())
+        # if _scan_source:
+        #     polarization["calibrated_source_path"] = _scan_source

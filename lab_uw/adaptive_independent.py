@@ -148,7 +148,7 @@ def _plan(functions,manifest,paired_rows,data,params):
         from .adaptive_preselection import frozen_plan
         return frozen_plan(functions,manifest,paired_rows,params)
     s=sequence.settings(params);signal=manifest['signal_mask'];noise=manifest['noise_mask']
-    taper=float(params.get('local_objective_taper_fraction',0.));anchor=manifest['anchor']
+    taper=float(params['local_objective_taper_fraction']);anchor=manifest['anchor']
     ref_position=anchor;ref=np.asarray(data[int(paired_rows[anchor].uw_idx)])
     threshold,calibration=sequence._reference_threshold(ref,anchor,paired_rows,data,signal,noise,taper,s)
     gate_state={'gate_confirmation_count':0};entries={}
@@ -223,7 +223,6 @@ def _run_one(functions,context,position,*,state,seed_kind,seed_hash,pending=None
         assembly=_restore(functions,simulation,pending['local_continuation_state'],observed,time,exact=True)
         stopping=pending['local_stopping'];previous_history=deepcopy(pending['local_iteration_history'])
         local_params['_adaptive_resume_monitor']=deepcopy(stopping['continuation'])
-        local_params['_adaptive_resume_limits']=deepcopy(stopping['step_limits'])
     else:
         assembly=_restore(functions,simulation,_fresh_state(state),observed,time)
         simulation.local_inversion_history=[]
@@ -251,8 +250,13 @@ def _run_one(functions,context,position,*,state,seed_kind,seed_hash,pending=None
     row=functions['_build_local_result_row'](rec_n=int(assembly['rec_n']),assembly_dict=assembly,
         simulation=simulation,result_local=result)
     row['local_continuation_state']=enrich_local_checkpoint(row['local_continuation_state'],simulation)
+    row['adaptive_initial_consistency']=deepcopy(getattr(simulation, 'adaptive_initial_consistency', None))
     row.update(result_fields(simulation));row['local_anchor_stride']=1;row['local_records_per_worker']=1
     row['adaptive_state']={'schema':SCHEMA,'fingerprint':manifest['fingerprint'],'independent':True}
+    row['effective_configuration']={'adaptive_inversion':sequence.settings(params),
+        'local_optimizer':optimizer_settings(params),
+        'local_misfit_duration_us':params['local_misfit_duration_us'],
+        'local_update_strategy':'material_search'}
     row['adaptive_independent']={'schema':SCHEMA,'fingerprint':manifest['fingerprint'],'position':position,
         'role':role,'status':'complete' if complete else 'pending','initial_model_kind':seed_kind,
         'initial_model_hash':seed_hash,'initial_model_rec_n':manifest['reference_rec_n'],
@@ -318,8 +322,13 @@ def _reuse_row(functions,context,manifest,position,reference):
     simulation=result['simulation_handler']
     row=functions['_build_local_result_row'](rec_n=int(assembly['rec_n']),assembly_dict=assembly,simulation=simulation,result_local=result)
     row['local_continuation_state']=enrich_local_checkpoint(row['local_continuation_state'],simulation);row.update(result_fields(simulation))
+    row['adaptive_initial_consistency']=deepcopy(getattr(simulation, 'adaptive_initial_consistency', None))
     row['local_anchor_stride']=1;row['local_records_per_worker']=1
     row['adaptive_state']={'schema':SCHEMA,'fingerprint':manifest['fingerprint'],'independent':True}
+    row['effective_configuration']={'adaptive_inversion':sequence.settings(p),
+        'local_optimizer':optimizer_settings(p),
+        'local_misfit_duration_us':p['local_misfit_duration_us'],
+        'local_update_strategy':'material_search'}
     row['adaptive_independent']={'schema':SCHEMA,'fingerprint':manifest['fingerprint'],'position':position,
         'role':'reuse','status':'complete','initial_model_kind':manifest['initial_model_kind'],
         'initial_model_hash':manifest['seed_hash'],'initial_model_rec_n':manifest['reference_rec_n'],
@@ -404,12 +413,13 @@ def _execute(functions,*,global_row,last,anchor,next_position,truncate_to,result
     else:
         if next_position!=anchor:raise ValueError('Independent manifest is missing; completed models cannot safely infer the original seed.')
         ensure_reference(simulation)
-        signal,noise=sequence._masks(simulation,s)
+        signal,noise=sequence._masks(simulation,s,stf_handler=stf_handler,
+            params=params,compute_travel_time=functions['compute_dds_travel_time'])
         global_seed=functions['_capture_local_continuation_state'](assembly,simulation)
         global_seed=enrich_local_checkpoint(global_seed,simulation)
         ii=np.concatenate([global_seed['idx_dict'][name] for name in REGIONS])
         lower=s['velocity_lower_bound_m_s']
-        lower=float(lower)/1e4 if lower is not None else .25*float(np.min(global_seed['velocity_array'][ii]))
+        lower=float(lower)/1e4 if lower is not None else s['independent_lower_bound_fraction']*float(np.min(global_seed['velocity_array'][ii]))
         if lower>float(np.min(global_seed['velocity_array'][ii]))+1e-12:
             raise ValueError('The selected velocity lower bound excludes the homogeneous initial model.')
         manifest={'schema':SCHEMA,'fingerprint':fingerprint,'anchor':anchor,
@@ -466,7 +476,7 @@ def _execute(functions,*,global_row,last,anchor,next_position,truncate_to,result
                 if row['adaptive_independent']['status']=='complete':continue
             specs.append({'lane_id':position,'positions':[position],'continuation_state':None})
         print(f'Independent adaptive inversion: seed={s["initial_model"]}, selected={sum(e["selected"] for e in manifest["plan"].values())}, '
-              f'jobs this pass={len(specs)}, requested workers={params.get("local_inversion_workers",1)}, '
+              f'jobs this pass={len(specs)}, requested workers={params["local_inversion_workers"]}, '
               f'fixed lower bound={lower*1e4 if "lower" in locals() else manifest["velocity_lower_bound_cm_us"]*1e4:.6g} m/s.',flush=True)
         if specs:
             for _,row in functions['_run_parallel_local_inversions'](paired_rows=paired_rows,

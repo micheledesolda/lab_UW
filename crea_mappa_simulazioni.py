@@ -645,7 +645,7 @@ def prepare_main(source, *, wave_type, basename):
             node.value = ast.Constant(basename); changes.add('selected_uw_basename')
         body.append(node)
         if 'params' in names:
-            body.extend(ast.parse("params['diagnostic_plot_only'] = False\nparams['run_local_inversion'] = False").body)
+            body.extend(ast.parse("params['diagnostic_plot_only'] = False").body)
             changes.add('params')
     if changes != {'wave_type', 'selected_uw_basename', 'params'}:
         raise ValueError(f'Configurazione principale non riconosciuta ({sorted(changes)}); nessuna esecuzione.')

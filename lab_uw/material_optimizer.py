@@ -9,12 +9,39 @@ from copy import deepcopy
 import hashlib,json
 import numpy as np
 
-DEFAULTS={'enabled':True,'memory':8,'initial_fraction':.02,'armijo':1e-4,
-          'backtracks':18,'expansions':6,'minimum_gain_absolute':1e-6,
-          'minimum_gain_relative':1e-5,'weak_cycles':2,'projected_gradient_tolerance':1e-9}
+# Schema only: no implicit numerical defaults. Values live in main params.
+CORE_REQUIRED = (
+    'enabled','memory','initial_fraction','armijo','backtracks','expansions',
+    'backtrack_factor','expansion_factor','lbfgs_initial_alpha',
+    'minimum_gain_absolute','minimum_gain_relative','weak_cycles',
+    'projected_gradient_tolerance','material_scale_floor',
+    'bound_projection_tolerance','curvature_absolute_tolerance',
+    'curvature_relative_tolerance','descent_direction_tolerance',
+    'direction_norm_floor',
+    'checkpoint_search_history','velocity_lower_bound_fraction',
+    'forward_consistency_rtol','forward_consistency_atol',
+)
+DEFAULTS={key:None for key in CORE_REQUIRED}
+
 
 def settings(params):
-    p={**DEFAULTS,**params.get('local_optimizer',{})}
+    if 'local_optimizer' not in params:
+        raise ValueError('Missing explicit params["local_optimizer"]')
+    p=deepcopy(params['local_optimizer'])
+    missing=set(CORE_REQUIRED)-set(p)
+    if missing:raise ValueError(f'local_optimizer: missing {sorted(missing)}')
+    if not 0 < p['backtrack_factor'] < 1:
+        raise ValueError('local_optimizer.backtrack_factor must lie in (0,1)')
+    if p['expansion_factor'] <= 1:
+        raise ValueError('local_optimizer.expansion_factor must exceed 1')
+    for key in ('lbfgs_initial_alpha','material_scale_floor','bound_projection_tolerance',
+                'curvature_absolute_tolerance','curvature_relative_tolerance',
+                'descent_direction_tolerance','direction_norm_floor',
+                'velocity_lower_bound_fraction','forward_consistency_rtol','forward_consistency_atol'):
+        if not np.isfinite(p[key]) or p[key] <= 0:
+            raise ValueError(f'local_optimizer.{key} must be positive finite')
+    if not isinstance(p['checkpoint_search_history'],int) or p['checkpoint_search_history']<1:
+        raise ValueError('local_optimizer.checkpoint_search_history must be positive integer')
     for k in ('memory','backtracks','expansions','weak_cycles'):
         if isinstance(p[k],bool) or int(p[k])!=p[k] or p[k]<1:raise ValueError(f'local_optimizer.{k} must be positive integer')
     for k in ('initial_fraction','minimum_gain_absolute','minimum_gain_relative','projected_gradient_tolerance'):
@@ -38,8 +65,8 @@ class MaterialOptimizer:
     def __init__(self,policy,velocity,damping,regions,v_lower,v_upper,active_velocity,active_damping,resume=None):
         self.policy=deepcopy(policy);self.ii=np.asarray(regions,dtype=int)
         self.active=(bool(active_velocity),bool(active_damping));n=len(self.ii)
-        self.scales=np.r_[np.full(n,max(float(np.mean(velocity[self.ii])),1e-8)),
-                          np.full(n,max(float(np.mean(damping[self.ii])),1e-8))]
+        self.scales=np.r_[np.full(n,max(float(np.mean(velocity[self.ii])),self.policy['material_scale_floor'])),
+                          np.full(n,max(float(np.mean(damping[self.ii])),self.policy['material_scale_floor']))]
         self.lower=np.r_[v_lower[self.ii],np.zeros(n)]/self.scales
         self.upper=np.r_[v_upper[self.ii],np.full(n,np.inf)]/self.scales
         self.pairs=[];self.previous_x=None;self.previous_g=None;self.weak=0;self.accepted=0
@@ -50,7 +77,12 @@ class MaterialOptimizer:
             self.last_iteration=int(resume.get('last_iteration',0));self.accepted=int(resume.get('accepted',0))
             if resume.get('optimizer_revision')==3:
                 changes=policy_changes(resume['policy'],self.policy)
-                if resume.get('reason') is not None:raise ValueError('Cannot resume an optimizer that already converged.')
+                old_reason=resume.get('reason')
+                if old_reason in ('projected_gradient_converged','no_active_parameters','minimum_useful_gain_reached'):                    raise ValueError('Cannot resume an already converged material optimizer.')
+                if old_reason=='line_search_stalled_nonstationary' and not changes:
+                    raise ValueError('The previous local search stalled with a nonzero projected gradient. '
+                        'The SAME record is pending: change an explicit local_optimizer line-search '
+                        'parameter or projected-gradient tolerance to attempt a scientifically controlled continuation.')
                 if resume.get('geometry_size')!=n:raise ValueError('Pending optimizer geometry changed.')
                 if tuple(resume['active'])!=self.active:raise ValueError('Pending optimizer active parameters changed.')
                 for k in ('scales','pairs','previous_x','previous_g','weak','searches','total_receiver_calls','last_alpha','lower','upper'):
@@ -81,14 +113,19 @@ class MaterialOptimizer:
         p=p.copy();n=len(self.ii)
         if not self.active[0]:p[:n]=0
         if not self.active[1]:p[n:]=0
-        p[(x<=self.lower+1e-14)&(p<0)]=0
-        p[(x>=self.upper-1e-14)&(p>0)]=0
+        p[(x<=self.lower+self.policy['bound_projection_tolerance'])&(p<0)]=0
+        p[(x>=self.upper-self.policy['bound_projection_tolerance'])&(p>0)]=0
         return p
 
     def _direction(self,x,g):
         if self.previous_x is not None:
             s=x-self.previous_x;y=g-self.previous_g;sy=float(s@y)
-            if sy>max(1e-14,1e-10*np.linalg.norm(s)*np.linalg.norm(y)):
+            threshold=max(self.policy['curvature_absolute_tolerance'],
+                self.policy['curvature_relative_tolerance']*np.linalg.norm(s)*np.linalg.norm(y))
+            accepted_pair=bool(sy>threshold)
+            self.last_info.update(curvature_sTy=sy,curvature_threshold=float(threshold),
+                                  curvature_pair_accepted=accepted_pair)
+            if accepted_pair:
                 self.pairs.append((s.copy(),y.copy(),1/sy));self.pairs=self.pairs[-self.policy['memory']:]
         self.previous_x=x.copy();self.previous_g=g.copy()
         q=g.copy();alphas=[]
@@ -99,7 +136,7 @@ class MaterialOptimizer:
         for (s,y,rho),alpha in zip(self.pairs,reversed(alphas)):
             q+=s*(alpha-rho*float(y@q))
         p=self._project_direction(x,-q)
-        if not np.all(np.isfinite(p)) or float(g@p)>=-1e-16:
+        if not np.all(np.isfinite(p)) or float(g@p)>=-self.policy['descent_direction_tolerance']:
             p=self._project_direction(x,-g);self.pairs=[]
         return p
 
@@ -137,20 +174,20 @@ class MaterialOptimizer:
             # Newton-like directions use alpha=1. Fresh gradient directions
             # start at a dimensionless physical fraction, independent of
             # previously collapsed normalized-gradient step limits.
-            alpha=float(start if start is not None else self.policy['initial_fraction']/max(np.max(np.abs(p)),1e-30))
+            alpha=float(start if start is not None else self.policy['initial_fraction']/max(np.max(np.abs(p)),self.policy['direction_norm_floor']))
             best=None
             for _ in range(self.policy['backtracks']):
                 best=trial(p,alpha,kind)
                 if best is not None:break
-                alpha*=.5
+                alpha*=self.policy['backtrack_factor']
             if best is None:return None
             for _ in range(self.policy['expansions']):
-                larger=trial(p,alpha*2,kind)
+                larger=trial(p,alpha*self.policy['expansion_factor'],kind)
                 if larger is None or larger['misfit']>=best['misfit']:break
-                best=larger;alpha*=2
+                best=larger;alpha*=self.policy['expansion_factor']
             return best
         direction=self._direction(x,g)
-        chosen=line(direction,'lbfgs',1. if self.pairs else None)
+        chosen=line(direction,'lbfgs',self.policy['lbfgs_initial_alpha'] if self.pairs else None)
         if chosen is not None:base=chosen
         gain=float(current_misfit)-base['misfit']
         if gain<useful:
@@ -177,7 +214,9 @@ class MaterialOptimizer:
         self.searches.append(info)
         # Keep bounded diagnostics in compact checkpoints. The full per-cycle
         # report is also written into the local iteration history.
-        self.searches=self.searches[-20:]
+        self.searches=self.searches[-self.policy['checkpoint_search_history']:]
+        # A small positive gain is NOT convergence. In particular,
+        # skipped/zero L-BFGS curvature never certifies stationarity.
         self.weak=self.weak+1 if info.get('rescue_checked') and info['gain']<info['useful_gain'] else 0
         print(f"    Optimizer: gain={info['gain']:.6g}, useful={info['useful_gain']:.6g}, "
               f"direction={info.get('selected','stationary')}, receiver trials={info['receiver_calls']}, "
@@ -185,7 +224,7 @@ class MaterialOptimizer:
         if info.get('stationary'):
             self.reason='projected_gradient_converged';return True
         if self.weak>=self.policy['weak_cycles']:
-            self.reason='optimizer_plateau_verified';return True
+            self.reason='minimum_useful_gain_reached';return True
         return False
 
     def finish(self,fallback,dc,da,ct,at,noise_level=None):
@@ -195,16 +234,14 @@ class MaterialOptimizer:
                       ('policy','scales','pairs','previous_x','previous_g','weak','accepted','last_iteration',
                        'reason','searches','total_receiver_calls','last_alpha','geometry_size','active','lower','upper')}
         continuation['optimizer_revision']=3
-        return {'reason':reason,'converged':reason in ('optimizer_plateau_verified','projected_gradient_converged','no_active_parameters'),
+        return {'reason':reason,'converged':reason in ('projected_gradient_converged','no_active_parameters','minimum_useful_gain_reached'),
                 'optimizer_revision':3,'initial_noise_level_single':noise_level,'noise_level_single':noise_level,
                 'noise_target':None,'minimum_block_gain':None,'block_accepted_updates':None,'patience_blocks':None,
                 'accepted_updates':self.accepted,'receiver_trial_calls':self.total_receiver_calls,
                 'last_search':deepcopy(self.last_info),'migration':self.migration,
                 'interpretation':'Numerical convergence after searched directions; not a global-minimum or noise-significance certificate.',
                 'continuation':continuation,
-                'step_limits':{'dc_max_start':max(dc,ct*(1+1e-6),1e-30) if self.active[0] else 0.,
-                               'da_max_start':max(da,at*(1+1e-6),1e-30) if self.active[1] else 0.,
-                               'dc_threshold':ct,'da_threshold':at}}
+                'step_limits':None}
 
 def make_optimizer(policy,*args,resume=None,**kwargs):
     if not policy or not policy.get('enabled'):return None

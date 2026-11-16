@@ -1489,9 +1489,9 @@ class UltrasonicModeler:
         #         "use a fixed experiment-wide trace scale for spectral reweighting"
         #     )
         update_strategy = str(update_strategy).strip().lower()
-        if update_strategy not in {"joint", "alternating", "cross_talk"}:
+        if update_strategy not in {"joint", "alternating", "cross_talk", "material_search"}:
             raise ValueError(
-                "update_strategy must be 'joint', 'alternating', or 'cross_talk'"
+                "update_strategy must be joint, alternating, cross_talk or material_search"
             )
 
         # ------------------------------------------------------------------
@@ -1582,6 +1582,40 @@ class UltrasonicModeler:
                 raise ValueError("fixed_trace_scale must be positive and finite")
         else:
             best_trace_scale = 1.0
+        # Compare last reference waveform and current waveform against the
+        # EXACT SAME newly recomputed forward. Distinguishes data variation
+        # from changes in geometry, source, scale, or objective window.
+        self.adaptive_initial_consistency = None
+        reference_obs = getattr(self, 'adaptive_reference_observed', None)
+        if reference_obs is not None:
+            reference_obs = np.asarray(reference_obs, dtype=float)
+            if reference_obs.shape == observed_waveform.shape:
+                if amplitude_scale_mode == 'profiled':
+                    reference_scale = fit_local_scale(
+                        observed_waveform=reference_obs,
+                        synthetic_waveform=initial_synthetic_waveform,
+                        misfit_interval=misfit_interval,
+                    )
+                else:
+                    reference_scale = best_trace_scale
+                reference_misfit = relative_waveform_objective(
+                    reference_obs,initial_synthetic_waveform*reference_scale,
+                    misfit_interval,spectral_gamma=spectral_gamma,
+                    taper_fraction=objective_taper_fraction)['total']
+                reference_samples = reference_obs[misfit_interval]
+                current_samples = observed_waveform[misfit_interval]
+                relative_data_change = float(
+                    np.dot(current_samples-reference_samples,current_samples-reference_samples)
+                    / max(np.dot(reference_samples,reference_samples), np.finfo(float).tiny))
+                self.adaptive_initial_consistency = {
+                    'previous_accepted_misfit':getattr(self,'adaptive_previous_accepted_misfit',None),
+                    'previous_wave_on_new_forward':float(reference_misfit),
+                    'data_relative_l2_squared':relative_data_change,
+                    'reference_scale_on_new_forward':float(reference_scale),
+                    'current_scale_on_new_forward':float(best_trace_scale),
+                    'window_start_us':float(observed_time[misfit_interval[0]]),
+                    'window_stop_us':float(observed_time[misfit_interval[-1]]),
+                }
         initial_synthetic_waveform *= best_trace_scale
 
         best_objective = relative_waveform_objective(
@@ -1592,6 +1626,15 @@ class UltrasonicModeler:
             taper_fraction=objective_taper_fraction,
         )
         initial_misfit = float(best_objective["total"])
+        if self.adaptive_initial_consistency is not None:
+            self.adaptive_initial_consistency['current_wave_on_new_forward'] = initial_misfit
+            diagnostic = self.adaptive_initial_consistency
+            print('Adaptive start: previous_J={} previous_on_new_forward={:.8g} '
+                  'current_on_new_forward={:.8g} data_change_L2²={:.8g}'.format(
+                diagnostic['previous_accepted_misfit'],
+                diagnostic['previous_wave_on_new_forward'],
+                diagnostic['current_wave_on_new_forward'],
+                diagnostic['data_relative_l2_squared']),flush=True)
 
         # ------------------------------------------------------------------
         # STORE "BEST" STATE
@@ -1637,8 +1680,11 @@ class UltrasonicModeler:
         mask[misfit_interval] = True
 
         updating = True
-        activate_velocity = dc_max > 0
-        activate_damping = da_max > 0
+        # A material-search inversion needs no external dc_max/da_max.
+        material_policy = getattr(self, 'optimization_policy', None)
+        active_material = bool(material_policy and material_policy['enabled'])
+        activate_velocity = active_material or dc_max > 0
+        activate_damping = active_material or da_max > 0
 
         # ----------------------------------------------------------
         # NODEWISE VELOCITY BOUNDS
@@ -1657,7 +1703,7 @@ class UltrasonicModeler:
             v_central = central_params["velocity" + self.wave_type]
 
             # optional lower bound; keep your current logic or replace with a physical one
-            vmin_update = max(1e-12, 0.25 * np.min(initial_velocity_model[regions_to_update]))
+            vmin_update = max(1e-12, float(material_policy['velocity_lower_bound_fraction']) * np.min(initial_velocity_model[regions_to_update])) if active_material else max(1e-12, 0.25 * np.min(initial_velocity_model[regions_to_update]))
             # ADAPTIVE_INDEPENDENT_FIXED_BOUNDS_V1
             fixed_lower = getattr(self, "independent_velocity_lower_bound_cm_us", None)
             if fixed_lower is not None:
@@ -1680,7 +1726,7 @@ class UltrasonicModeler:
             v_upper[idx_dict["groove_sb2"]] = v_side2
 
         elif self.geometry_type == "block":
-            vmin_update = max(1e-12, 0.25 * np.min(initial_velocity_model[regions_to_update]))
+            vmin_update = max(1e-12, float(material_policy['velocity_lower_bound_fraction']) * np.min(initial_velocity_model[regions_to_update])) if active_material else max(1e-12, 0.25 * np.min(initial_velocity_model[regions_to_update]))
             # ADAPTIVE_INDEPENDENT_FIXED_BOUNDS_V1
             fixed_lower = getattr(self, "independent_velocity_lower_bound_cm_us", None)
             if fixed_lower is not None:
@@ -1768,6 +1814,27 @@ class UltrasonicModeler:
             )
             return wavefield, synthetic_waveform, trace_scale, objective
 
+        # Numerical invariant: the full leapfrog forward and the receiver-only
+        # leapfrog used for the line search MUST produce the same initial trace.
+        # A mismatch is a model/implementation error, not a reason to restart
+        # BFGS with a larger step.
+        material_policy = getattr(self, 'optimization_policy', None)
+        if material_policy is not None and material_policy['enabled']:
+            check_waveform, check_scale, check_obj = _evaluate_receiver_only_candidate(
+                best_velocity_model, best_damping_model, best_density_model)
+            np.testing.assert_allclose(
+                check_waveform, best_synthetic_waveform,
+                rtol=material_policy['forward_consistency_rtol'],
+                atol=material_policy['forward_consistency_atol'],
+                err_msg='Full-field/receiver-only forward mismatch at initial model',
+            )
+            np.testing.assert_allclose(
+                check_obj['total'], best_misfit,
+                rtol=material_policy['forward_consistency_rtol'],
+                atol=material_policy['forward_consistency_atol'],
+                err_msg='Full-field/receiver-only misfit mismatch at initial model',
+            )
+
         # SCIENTIFIC_LOCAL_STOP_V1
         from lab_uw.adaptive_stopping import make_monitor
         # SEARCHED_MATERIAL_OPTIMIZER_V3
@@ -1781,6 +1848,10 @@ class UltrasonicModeler:
             density_regions=(pure_gouge_indices(idx_dict) if invert_density else None),
         )
         scientific_monitor = make_monitor(getattr(self, "scientific_stop_policy", None), best_misfit, spectral_gamma, getattr(self, "scientific_stop_resume_state", None)) if material_optimizer is None else None
+        if material_optimizer is not None and update_strategy != "material_search":
+            raise ValueError('Active material optimizer requires update_strategy=material_search')
+        if material_optimizer is None and update_strategy == "material_search":
+            raise ValueError('material_search requested but material_optimizer is disabled')
         scientific_fallback_reason = "budget_exhausted"
 
         for iteration in range(n_iterations):
@@ -2121,29 +2192,32 @@ class UltrasonicModeler:
             else:
                 updating = False
 
-            if update_strategy == "joint":
-                if not trial_was_accepted:
-                    if velocity_available:
+            # Separate optimizers: the material optimizer owns its own alpha
+            # line search and neither dc_max nor da_max controls it.
+            if material_optimizer is None:
+                if update_strategy == "joint":
+                    if not trial_was_accepted:
+                        if velocity_available:
+                            dc_max /= reduce_factor
+                        if damping_available:
+                            da_max /= reduce_factor
+                elif update_strategy == "alternating":
+                    if not trial_was_accepted:
+                        if parameter_block == "velocity":
+                            dc_max /= reduce_factor
+                        else:
+                            da_max /= reduce_factor
+                else:
+                    if velocity_available and (
+                        velocity_only_misfit is None
+                        or velocity_only_misfit >= old_best_misfit
+                    ):
                         dc_max /= reduce_factor
-                    if damping_available:
+                    if damping_available and (
+                        damping_only_misfit is None
+                        or damping_only_misfit >= old_best_misfit
+                    ):
                         da_max /= reduce_factor
-            elif update_strategy == "alternating":
-                if not trial_was_accepted:
-                    if parameter_block == "velocity":
-                        dc_max /= reduce_factor
-                    else:
-                        da_max /= reduce_factor
-            else:
-                if velocity_available and (
-                    velocity_only_misfit is None
-                    or velocity_only_misfit >= old_best_misfit
-                ):
-                    dc_max /= reduce_factor
-                if damping_available and (
-                    damping_only_misfit is None
-                    or damping_only_misfit >= old_best_misfit
-                ):
-                    da_max /= reduce_factor
 
             misfit_gap = updated_misfit - old_best_misfit
             # print(f"misfit gap: {misfit_gap}")
@@ -2278,19 +2352,19 @@ class UltrasonicModeler:
                 outfile_path=waveform_output_path,
             )
 
-            if dc_max_start:
-                self.velocity_model_handler.plot(
-                    model=self.velocity_model_handler.velocity_array,
-                    outfile_path=velocity_model_output_path,
-                    quantity="velocity",
-                )
 
-            if da_max_start:
-                self.velocity_model_handler.plot(
-                    model=self.velocity_model_handler.damping_array,
-                    outfile_path=damping_model_output_path,
-                    quantity="damping",
-                )
+            self.velocity_model_handler.plot(
+                model=self.velocity_model_handler.velocity_array,
+                outfile_path=velocity_model_output_path,
+                quantity="velocity",
+            )
+
+
+            self.velocity_model_handler.plot(
+                model=self.velocity_model_handler.damping_array,
+                outfile_path=damping_model_output_path,
+                quantity="damping",
+            )
 
             _plot_local_misfit_history(
                 self.local_inversion_history,
